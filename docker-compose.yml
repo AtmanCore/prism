@@ -1,0 +1,26 @@
+# PRism in Docker. First time:
+#   ./setup.sh                  # creates config.json and .env, gets your tokens (see docs/setup.md)
+#   docker compose up -d --build
+services:
+  prism:
+    build: .
+    image: prism:local
+    container_name: prism
+    restart: unless-stopped
+    env_file: .env
+    ports:
+      # Reachable from this machine only.
+      - "127.0.0.1:${PR_REVIEW_PORT:-6161}:${PR_REVIEW_PORT:-6161}"
+    volumes:
+      - ./config.json:/app/config.json      # your settings (the UI saves knowledge-base changes here)
+      - ./.env:/app/.env:ro
+      - ./data:/app/data                    # reports, chats, decisions, lessons
+      - prism-workspace:/app/workspace      # git clones and per-PR worktrees
+      - prism-claude:/home/prism/.claude    # Claude Code state (keeps chat sessions)
+      # Knowledge bases: ./setup.sh kb mounts your folders under /home/prism/kb (in docker-compose.override.yml,
+      # which compose loads automatically). By hand, e.g.:
+      # - ~/kb/my-platform:/home/prism/kb/my-platform:ro
+
+volumes:
+  prism-workspace:
+  prism-claude:

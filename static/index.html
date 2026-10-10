@@ -1,0 +1,76 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>PRism</title>
+  <link rel="icon" type="image/svg+xml" href="/favicon.svg">
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <header class="topnav">
+    <button class="icon-btn menu-btn" id="menuBtn" aria-label="Toggle sidebar">
+      <svg viewBox="0 0 24 24" width="20" height="20"><path d="M4 6h16M4 12h16M4 18h16" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
+    </button>
+    <a class="brand" href="#/">
+      <img class="brand-logo logo-light" src="/logo-light.svg" alt=""><img class="brand-logo logo-dark" src="/logo-dark.svg" alt="">
+      <span class="brand-name">PR<span class="ism">ism</span></span>
+    </a>
+    <div class="search">
+      <svg viewBox="0 0 24 24" width="16" height="16"><circle cx="11" cy="11" r="6.5" stroke="currentColor" stroke-width="2" fill="none"/><path d="m16 16 4 4" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
+      <input id="search" type="search" placeholder="Search PRs, repos, authors, tickets" autocomplete="off">
+    </div>
+    <div class="topnav-right">
+      <span class="sync" id="syncStatus">Connecting…</span>
+      <select class="sync-every" id="syncEvery" title="How often PRism checks GitHub for review requests" aria-label="Sync interval">
+        <option value="1">Every 1 min</option><option value="2">Every 2 min</option><option value="5">Every 5 min</option>
+        <option value="10">Every 10 min</option><option value="15">Every 15 min</option><option value="30">Every 30 min</option>
+        <option value="60">Every 60 min</option>
+      </select>
+      <button class="btn" id="pollBtn" title="Check GitHub for new review requests now">
+        <svg viewBox="0 0 24 24" width="14" height="14"><path d="M20 12a8 8 0 1 1-2.3-5.7M20 4v5h-5" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        <span>Sync now</span>
+      </button>
+      <button class="btn tint-orange" id="clearBtn" title="Delete PRism's local reviews, chats and clones">
+        <svg viewBox="0 0 24 24" width="14" height="14"><path d="M5 7h14M10 7V5h4v2M7 7l1 12h8l1-12" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        <span>Clear local data</span>
+      </button>
+      <span class="avatar" id="viewer" title=""></span>
+    </div>
+  </header>
+
+  <div class="shell">
+    <nav class="sidebar" id="sidebar">
+      <div class="project">
+        <img class="project-icon logo-light" src="/queue-light.svg" alt=""><img class="project-icon logo-dark" src="/queue-dark.svg" alt="">
+        <div>
+          <div class="project-name">Review queue</div>
+          <div class="project-sub" id="orgName">GitHub</div>
+        </div>
+      </div>
+      <div class="nav-section">Planning</div>
+      <a class="nav-item" data-view="todo" href="#/view/todo"><span class="nav-ico">◎</span>To review<span class="count" data-count="todo"></span></a>
+      <a class="nav-item" data-view="authored" href="#/view/authored"><span class="nav-ico">✎</span>My PRs<span class="count" data-count="authored"></span></a>
+      <a class="nav-item" data-view="ready" href="#/view/ready"><span class="nav-ico">●</span>Ready again<span class="count" data-count="ready"></span></a>
+      <a class="nav-item" data-view="mine" href="#/view/mine"><span class="nav-ico">✓</span>Reviewed by you<span class="count" data-count="mine"></span></a>
+      <a class="nav-item" data-view="all" href="#/view/all"><span class="nav-ico">≡</span>All open<span class="count" data-count="all"></span></a>
+      <a class="nav-item" data-view="attention" href="#/view/attention"><span class="nav-ico">▲</span>Needs attention<span class="count" data-count="attention"></span></a>
+      <a class="nav-item" data-view="running" href="#/view/running"><span class="nav-ico">↻</span>In review<span class="count" data-count="running"></span></a>
+      <a class="nav-item" data-view="failed" href="#/view/failed"><span class="nav-ico">!</span>Failed<span class="count" data-count="failed"></span></a>
+      <a class="nav-item" data-view="archived" href="#/view/archived"><span class="nav-ico">▢</span>Merged / closed<span class="count" data-count="archived"></span></a>
+      <a class="nav-item" data-view="learning" href="#/learning"><span class="nav-ico">✦</span>Learned lessons</a>
+      <div class="nav-section">Knowledge bases</div>
+      <div id="kbNav"></div>
+      <a class="nav-item" data-view="settings-kb" href="#/settings/kb"><span class="nav-ico">⚙</span>Manage knowledge bases</a>
+      <div class="nav-section">Repositories</div>
+      <div id="repoNav"></div>
+      <div class="sidebar-foot">Nothing is posted to GitHub unless you confirm it in the post dialog.</div>
+    </nav>
+
+    <main class="main" id="main"></main>
+  </div>
+
+  <div class="toast" id="toast" role="status" aria-live="polite"></div>
+  <script src="/app.js"></script>
+</body>
+</html>

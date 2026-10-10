@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64"><defs>
+<clipPath id="tile"><rect width="64" height="64" rx="14"/></clipPath>
+<linearGradient id="mist" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#e6edf6"/><stop offset="1" stop-color="#c8d5e6"/></linearGradient>
+<linearGradient id="night" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#1c2438"/><stop offset="1" stop-color="#26324d"/></linearGradient>
+<linearGradient id="softspec" x1="0" y1="1" x2="1" y2="0"><stop offset="0" stop-color="#f4978e"/><stop offset=".25" stop-color="#f7bf7f"/><stop offset=".45" stop-color="#f9e08b"/><stop offset=".62" stop-color="#9ad8b0"/><stop offset=".8" stop-color="#8ec9ea"/><stop offset="1" stop-color="#b3a6f2"/></linearGradient>
+<linearGradient id="glass2" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#f4f6ef"/><stop offset="1" stop-color="#c6ccbb"/></linearGradient>
+<linearGradient id="glass3" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#ffffff"/><stop offset="1" stop-color="#cfd8e4"/></linearGradient>
+<linearGradient id="beam2" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#fff" stop-opacity="0"/><stop offset=".6" stop-color="#fff" stop-opacity=".95"/></linearGradient>
+<linearGradient id="beam3" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#3d4b63" stop-opacity=".15"/><stop offset=".6" stop-color="#3d4b63"/></linearGradient>
+</defs><g clip-path="url(#tile)"><rect width="64" height="64" fill="url(#mist)"/><rect x="12" y="9" width="40" height="6" rx="3" fill="#e0675c"/><rect x="12" y="19" width="32" height="6" rx="3" fill="#ec9440"/><rect x="12" y="29" width="37" height="6" rx="3" fill="#e6b52e"/><rect x="12" y="39" width="26" height="6" rx="3" fill="#3fae6e"/><rect x="12" y="49" width="33" height="6" rx="3" fill="#3c95d1"/><rect x=".75" y=".75" width="62.5" height="62.5" rx="13.3" fill="none" stroke="#9fb0c8" stroke-width="1.5"/></g></svg>

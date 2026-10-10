@@ -1,0 +1,8 @@
+# Style for PRism's Python (dev only: run .venv/bin/ruff check .)
+line-length = 120
+target-version = "py39"
+extend-exclude = [".venv", "data", "workspace"]
+
+[lint]
+select = ["E", "F", "W", "B"]
+ignore = ["B008"]

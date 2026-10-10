@@ -1,0 +1,4 @@
+# Test-only tools. The service itself has no dependencies.
+pytest
+pytest-cov
+ruff

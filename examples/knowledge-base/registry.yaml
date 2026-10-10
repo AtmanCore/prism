@@ -1,0 +1,16 @@
+# Service registry: maps each service to its GitHub repo.
+# PRism attaches this KB to any PR in a listed repo automatically.
+# Rules: each entry starts with "- name:", and has a "repo: owner/name" line.
+# Other keys are allowed and ignored by the matcher (but readers of the KB can use them).
+services:
+  - name: orders-api
+    repo: my-org/orders-api
+    role: "HTTP API for creating and querying orders."
+    upstream: [web-frontend]
+    downstream: [billing-worker, orders-db]
+
+  - name: billing-worker
+    repo: my-org/billing-worker
+    role: "Consumes order events and charges customers."
+    upstream: [orders-api]
+    downstream: [payments-provider, billing-db]

@@ -1,0 +1,7 @@
+{
+  "repo": "my-org/billing-worker",
+  "ref": "main",
+  "commit_sha": "8d01b6c4e2f9",
+  "generated_at": "2026-10-01T12:00:00+00:00",
+  "generated_by": "prism-kb-builder"
+}

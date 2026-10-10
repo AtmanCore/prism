@@ -1,0 +1,39 @@
+{
+  "port": 6161,
+  "github": {
+    "search_query": "is:pr is:open draft:false review-requested:@me",
+    "orgs": [],
+    "include_my_reviews": true,
+    "my_reviews_window_days": 30,
+    "clone_url": "git@github.com:{repo}.git"
+  },
+  "poll_interval_sec": 300,
+  "auto_review": true,
+  "my_prs": {"enabled": true, "auto_review": false},
+  "auto_rereview_on_new_commits": true,
+  "max_concurrent_reviews": 3,
+  "review_timeout_sec": 2700,
+  "response_check_timeout_sec": 900,
+  "chat_timeout_sec": 600,
+  "claude": {
+    "bin": "claude",
+    "model": null,
+    "draft_model": "sonnet",
+    "chat_model": null
+  },
+  "reviewer": {
+    "mode": "bundled",
+    "skill_path": "~/.claude/commands/pr-review.md",
+    "lessons_files": {
+      "code": "data/lessons/code-reviewer.lessons.md",
+      "consistency": "data/lessons/consistency-reviewer.lessons.md"
+    }
+  },
+  "tickets": {
+    "key_pattern": "[A-Z][A-Z0-9]+-[0-9]+",
+    "url_template": null,
+    "read_tools": [],
+    "deny_tools": []
+  },
+  "knowledge_bases": []
+}

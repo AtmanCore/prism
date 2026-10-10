@@ -1,0 +1,25 @@
+# personal settings and secrets
+.env
+config.json
+config.local.json
+.claude/settings.local.json
+
+# runtime state
+/data/
+service.drain
+/workspace/
+service.log
+service.pid
+__pycache__/
+*.tmp
+
+# local tooling
+.DS_Store
+.venv/
+docker-compose.override.yml
+.coverage
+.ruff_cache/
+.pytest_cache/
+htmlcov/
+coverage.xml
+.idea/
