@@ -36,6 +36,16 @@ const MY = {
   authored: ["purple", "Your PR"],
 };
 const CLOSED = { MERGED: ["purple", "Merged"], CLOSED: ["red", "Closed"], DRAFT: ["gray", "Back to draft"], OPEN: ["gray", "Not requested"], UNKNOWN: ["gray", "Gone"] };
+
+function kTok(n) { return n >= 1e6 ? `${(n / 1e6).toFixed(1)}M` : n >= 1e3 ? `${Math.round(n / 1e3)}k` : `${n || 0}`; }
+function tokenUsage(usage) {
+  const rows = Object.entries(usage || {});
+  if (!rows.length) return '<span class="muted">n/a</span>';
+  return rows.map(([model, u]) => `<div title="${esc(model)}"><span class="mono">${esc(model.replace(/^claude-/, ""))}</span>: `
+    + `${kTok(u.input)} in · ${kTok(u.output)} out · ${kTok(u.cache_read)} cache read · ${kTok(u.cache_write)} cache write`
+    + `${u.cost_usd != null ? ` (~$${Number(u.cost_usd).toFixed(2)})` : ""}</div>`).join("");
+}
+
 function myState(p) { return p.my_state || "to-review"; }
 function myLoz(p, long = false) {
   if (!p.active) { const [c, l] = CLOSED[p.closed_state] || ["gray", "No longer open"]; return `<span class="loz ${c}">${l}</span>`; }
@@ -549,6 +559,7 @@ function renderDetail() {
             <dt>Trigger</dt><dd>${esc(meta.reason || "n/a")}</dd>
             <dt>Lint</dt><dd>${esc(f?.lint || "n/a")}</dd>
             <dt title="What this run would cost at API prices. Not billed when claude runs on your subscription.">API-price est.</dt><dd title="Not billed when claude runs on your subscription">${meta.cost_usd != null ? `~$${meta.cost_usd.toFixed(2)}` : "n/a"}</dd>
+            <dt title="Tokens per model: new input, output, and prompt cache read / written">Tokens</dt><dd>${tokenUsage(meta.model_usage)}</dd>
           </dl>
         </div>
         <div class="panel"><div class="panel-head">Created</div>

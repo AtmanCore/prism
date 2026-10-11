@@ -210,6 +210,10 @@ DEFAULTS: dict = {
     "response_check_timeout_sec": 900,
     "claude": {"bin": "claude", "model": None, "draft_model": "sonnet", "chat_model": None},
     "chat_timeout_sec": 600,
+    # After a review, /compact a copy of its session (cheap while its cache is warm) so "Ask the agent"
+    # starts from the reviewer's own memory of the code. false = chats start from the report alone.
+    "compact_after_review": True,
+    "compact_timeout_sec": 180,
     "reviewer": {
         "mode": "bundled",  # "bundled" = reviewers/*.md shipped here; "user" = your ~/.claude skill + agents
         "skill_path": "~/.claude/commands/pr-review.md",
@@ -1148,6 +1152,8 @@ def agents_file() -> Path:
         body = m.group(2).replace("{lessons_file}", str(lessons.get(kind, "")))
         agents[meta["name"]] = {"description": meta.get("description", ""), "prompt": body,
                                 "tools": [x.strip() for x in meta.get("tools", "").split(",") if x.strip()]}
+        if meta.get("model"):  # e.g. the consistency pass runs on a cheaper model than the code pass
+            agents[meta["name"]]["model"] = meta["model"]
     out = DATA / "agents.json"
     out.write_text(json.dumps(agents, indent=1))
     return out
@@ -1291,9 +1297,10 @@ def run_claude(pr: dict, wt: Path, prompt: str, run_dir: Path, progress) -> dict
 
 
 def parse_output(text: str) -> tuple[str, dict | None]:
+    """The review's report and findings. Reviews emit only FINDINGS_JSON and the report is rendered
+    from it (writing both made the model generate every finding twice); a <<<REPORT block still wins."""
     report_m = re.search(r"<<<REPORT\s*\n(.*?)\n\s*REPORT>>>", text, re.S)
     json_m = re.search(r"<<<FINDINGS_JSON\s*\n(.*?)\n\s*FINDINGS_JSON>>>", text, re.S)
-    report = report_m.group(1).strip() if report_m else text.strip()
     findings = None
     if json_m:
         raw = json_m.group(1).strip()
@@ -1302,7 +1309,81 @@ def parse_output(text: str) -> tuple[str, dict | None]:
             findings = json.loads(raw)
         except json.JSONDecodeError:
             findings = None
+    if report_m:
+        report = report_m.group(1).strip()
+    elif isinstance(findings, dict):
+        report = render_report(findings)
+    else:
+        report = text.strip()
     return report, findings
+
+
+def render_report(f: dict) -> str:
+    """The plain-text "Full report" for a review, built from its findings JSON."""
+    def lines(*parts):
+        return [x for x in parts if x]
+    ticket = f.get("ticket") or {}
+    out = lines(f"Verdict: {f.get('verdict') or 'n/a'}",
+                f"Ticket: {ticket.get('key')} — {ticket.get('summary') or ''}".rstrip(" —")
+                if ticket.get("key") else "Ticket: none linked",
+                f"Lint: {f['lint']}" if f.get("lint") else "", "", str(f.get("summary") or "").strip(), "")
+    must = f.get("must_fix") or []
+    out.append("MUST FIX")
+    for i, m in enumerate(must, 1):
+        out += [f"{i}. [{str(m.get('severity', '')).upper()}] {m.get('title', '')} ({m.get('ref') or 'n/a'})",
+                f"   Cause: {m.get('cause', '')}", f"   Why it matters: {m.get('why', '')}",
+                f"   Fix: {m.get('fix', '')}", f"   Importance: {m.get('importance', '')}"]
+    if not must:
+        out.append("None. Nothing blocks this PR.")
+    flow = f.get("flow_context") or {}
+    if flow.get("summary"):
+        out += ["", "FLOW CONTEXT", str(flow["summary"]).strip(), f"Source: {flow.get('source') or 'n/a'}"]
+    prev = f.get("previously_raised") or []
+    if prev:
+        out += ["", "PREVIOUSLY RAISED"]
+        out += [f"- [{p.get('status')}] {p.get('ref')}: {p.get('point')}. {p.get('reason') or ''}".rstrip()
+                for p in prev]
+    ac = f.get("ac_coverage") or []
+    if ac:
+        out += ["", "AC / SPEC CONSISTENCY"]
+        out += [f"- [{a.get('status')}] {a.get('criterion')} → {a.get('ref') or 'n/a'}"
+                + (f" ({a['note']})" if a.get("note") else "") for a in ac]
+    for x in f.get("findings") or []:
+        out += ["", f"[{str(x.get('severity', '')).upper()}] {x.get('id', '')} {x.get('title', '')}".rstrip(),
+                f"Source: {x.get('source') or 'n/a'}   Scope: {x.get('scope') or 'n/a'}   "
+                f"Category: {x.get('category') or 'n/a'}",
+                f"Ref: {x.get('ref') or 'n/a'}"]
+        out += [f"{label}: {x[k]}" for k, label in (("why", "Why"), ("impact", "Impact"), ("fix", "Fix"))
+                if x.get(k)]
+        out.append("---")
+    kb = f.get("kb_regression") or {}
+    if kb.get("ran"):
+        out += ["", "KNOWLEDGE-BASE REGRESSION", str(kb.get("summary") or "").strip()]
+        out += [f"- checked: {c}" for c in kb.get("checked") or []]
+    items = f.get("findings") or []
+    counts = {s: sum(1 for x in items if str(x.get("severity", "")).lower() == s) for s in SEVERITIES}
+    scope = f.get("scope_filter") or {}
+    out += ["", "SUMMARY",
+            "- " + "  ".join(f"{s.capitalize()} {counts.get(s, 0)}" for s in SEVERITIES),
+            f"- Dropped as out-of-scope: {scope.get('dropped_out_of_scope', 0)}   "
+            f"Downgraded: {scope.get('downgraded_medium_to_low', 0)}"]
+    if f.get("top_priorities"):
+        out += ["", "TOP PRIORITIES"] + [f"{i}. {t}" for i, t in enumerate(f["top_priorities"], 1)]
+    if f.get("residual_risk"):
+        out += ["", f"RESIDUAL RISK: {f['residual_risk']}"]
+    if f.get("not_validated"):
+        out += [f"AREAS NOT FULLY VALIDATED: {'; '.join(map(str, f['not_validated']))}"]
+    return "\n".join(out).strip() + "\n"
+
+
+def token_usage(result: dict) -> dict:
+    """Per-model token counts and API-price cost of one claude run, for the run's meta."""
+    out = {}
+    for model, u in (result.get("modelUsage") or {}).items():
+        out[model] = {"input": u.get("inputTokens", 0), "output": u.get("outputTokens", 0),
+                      "cache_read": u.get("cacheReadInputTokens", 0),
+                      "cache_write": u.get("cacheCreationInputTokens", 0), "cost_usd": u.get("costUSD")}
+    return out
 
 
 SEVERITIES = ("critical", "high", "medium", "low")
@@ -1361,7 +1442,8 @@ def _review(key: str, reason: str) -> None:
             "started_at": datetime.fromtimestamp(started, timezone.utc).isoformat(timespec="seconds"),
             "finished_at": now_iso(), "duration_sec": round(time.time() - started),
             "cost_usd": result.get("total_cost_usd"), "num_turns": result.get("num_turns"),
-            "is_error": result.get("is_error", False),
+            "is_error": result.get("is_error", False), "session_id": result.get("session_id"),
+            "model_usage": token_usage(result),
         }
         (run_dir / "findings.json").write_text(json.dumps({**findings, "meta": meta}, indent=1))
         failed = bool(result.get("is_error")) or not text
@@ -1372,6 +1454,8 @@ def _review(key: str, reason: str) -> None:
             ticket=(findings.get("ticket") or {}).get("key"),
             error=(text[:500] if failed else None), progress=None,
         )
+        if not failed and result.get("session_id") and CONFIG.get("compact_after_review", True):
+            start_compaction(key, run_id, wt, result["session_id"], run_dir)
     except Exception as exc:
         log.exception("review of %s failed", key)
         (run_dir / "error.txt").write_text(str(exc))
@@ -2331,25 +2415,112 @@ def build_chat_prompt(pr: dict, key: str, run_id: str, data: dict) -> str:
         decisions="\n".join(map(decision_line, ds)) if ds else "None yet.")
 
 
-def run_chat_claude(wt: Path, prompt: str, session: str | None) -> dict | None:
+COMPACT_PROMPT = ("/compact This session will be used to discuss the review with the reviewer. Keep every "
+                  "finding with its ID, the code you read and what it showed, the callers and paths you checked, "
+                  "and what you ruled out and why.")
+
+
+COMPACTING: dict[tuple[str, str], threading.Event] = {}  # (key, run_id) -> set when compaction ends
+
+
+def start_compaction(key: str, run_id: str, wt: Path, session: str, run_dir: Path) -> None:
+    """Compact the review's session in its own thread, outside the PR lock and the review worker slot.
+    A chat that starts meanwhile waits for it (see wait_for_compaction)."""
+    done = threading.Event()
+    COMPACTING[(key, run_id)] = done
+
+    def job() -> None:
+        try:
+            with busy(f"compact:{key}:{run_id}"):
+                compact_review_session(key, wt, session, run_dir)
+        except ClearingNow:
+            pass
+        finally:
+            done.set()
+            COMPACTING.pop((key, run_id), None)
+    threading.Thread(target=job, name=f"compact-{key}", daemon=True).start()
+
+
+def wait_for_compaction(key: str, run_id: str) -> None:
+    done = COMPACTING.get((key, run_id))
+    if done:
+        done.wait(CONFIG["compact_timeout_sec"] + 5)
+
+
+def compact_review_session(key: str, wt: Path, session: str, run_dir: Path) -> None:
+    """Compact a copy of the finished review's session for chats. Best effort: never raises."""
+    cmd = [CONFIG["claude"]["bin"], "-p", "--setting-sources", "user", "--output-format", "json", "--tools", "",
+           "--resume", session, "--fork-session"]
+    if CONFIG["claude"].get("model"):
+        cmd += ["--model", CONFIG["claude"]["model"]]
+    tag = f"compact:{key}"  # in RUNNING_PROCS so cancel, clear and restart can kill it
+    try:
+        if CLEARING.is_set():
+            return
+        proc = subprocess.Popen(cmd, cwd=wt, env=child_env(), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE, text=True, start_new_session=True)
+        RUNNING_PROCS[tag] = proc
+        try:
+            stdout, stderr = proc.communicate(COMPACT_PROMPT, timeout=CONFIG["compact_timeout_sec"])
+        except subprocess.TimeoutExpired:
+            os.killpg(proc.pid, signal.SIGTERM)
+            proc.communicate()
+            raise
+        finally:
+            RUNNING_PROCS.pop(tag, None)
+        out = json.loads(stdout)
+        if out.get("is_error") or not out.get("session_id"):
+            raise RuntimeError((stderr or stdout).strip()[-300:])
+        (run_dir / "session.json").write_text(json.dumps(
+            {"compacted": out["session_id"], "cost_usd": out.get("total_cost_usd"), "at": now_iso()}))
+    except Exception as exc:  # chats fall back to starting from the report
+        log.warning("compacting review session %s failed: %s", session, exc)
+
+
+def compacted_review_session(pr: dict, run_dir: Path, data: dict) -> str | None:
+    """The run's compacted review session, if a chat can start from it."""
+    if not CONFIG.get("compact_after_review", True):
+        return None
+    if (data.get("meta") or {}).get("head_sha") != pr.get("head_sha"):
+        return None  # the PR moved on: the review's memory of the code is stale
+    try:
+        return json.loads((run_dir / "session.json").read_text()).get("compacted")
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+# Errors that mean the resumed session itself is unusable. Anything else (rate limits, API errors)
+# would fail a fresh session too, so it isn't retried.
+SESSION_UNUSABLE_RE = re.compile(r"No conversation found|prompt is too long|context.{0,20}(limit|window)", re.I)
+
+
+def run_chat_claude(wt: Path, prompt: str, session: str | None, fork: bool = False) -> dict | None:
     cmd = [CONFIG["claude"]["bin"], "-p", "--setting-sources", "user", "--output-format", "json",
            "--permission-mode", "default",
            "--allowedTools", "Bash", "Read", "Grep", "Glob",
            "--disallowedTools", *denied_tools()]
     if session:
         cmd += ["--resume", session]
+    if session and fork:
+        cmd += ["--fork-session"]  # leave the review's own session untouched
     model = CONFIG["claude"].get("chat_model") or CONFIG["claude"].get("model")
     if model:  # unset: your own Claude Code default model
         cmd += ["--model", model]
-    proc = subprocess.run(cmd, input=prompt, capture_output=True, text=True, cwd=wt, env=child_env(),
-                          timeout=CONFIG.get("chat_timeout_sec", 600))
+    try:
+        proc = subprocess.run(cmd, input=prompt, capture_output=True, text=True, cwd=wt, env=child_env(),
+                              timeout=CONFIG["chat_timeout_sec"])
+    except subprocess.TimeoutExpired:
+        if session:
+            return None  # resuming a large session timed out: caller starts a fresh one
+        raise
     try:
         out = json.loads(proc.stdout)
     except json.JSONDecodeError:
         out = None
     if not out or out.get("is_error") or not out.get("result"):
-        if session:
-            return None  # session gone or unusable: caller starts a fresh one
+        detail = f"{proc.stderr}\n{proc.stdout}\n{(out or {}).get('result') or ''}"
+        if session and SESSION_UNUSABLE_RE.search(detail):
+            return None  # session gone or too big: caller starts a fresh one
         raise RuntimeError((proc.stderr or proc.stdout or "no output").strip()[-600:])
     return out
 
@@ -2418,7 +2589,12 @@ def _chat_turn(key: str, run_id: str, message: str, pr: dict, run_dir: Path, dat
         prompt = build_chat_prompt(pr, key, run_id, data)
         if recap:
             prompt += f"\n\n# Earlier in this discussion\n{recap}"
-        out = run_chat_claude(wt, f"{prompt}\n\n# The reviewer's message\n{message}", None)
+        prompt += f"\n\n# The reviewer's message\n{message}"
+        wait_for_compaction(key, run_id)
+        review_session = compacted_review_session(pr, run_dir, data)
+        out = run_chat_claude(wt, prompt, review_session, fork=True) if review_session else None
+        if out is None:
+            out = run_chat_claude(wt, prompt, None)
     with DECISION_LOCK:  # re-read: decisions may have been applied while the agent was thinking
         data = json.loads((run_dir / "findings.json").read_text())
         reply, proposals = split_proposals(out["result"], data, load_decisions(key))
@@ -2915,7 +3091,7 @@ class Handler(BaseHTTPRequestHandler):
                     return self._json({"error": str(exc)}, HTTPStatus.CONFLICT)
                 return self._json(chat_payload(key))
             if action == "cancel":
-                proc = RUNNING_PROCS.get(key)
+                proc = RUNNING_PROCS.get(key) or RUNNING_PROCS.get(f"compact:{key}")
                 if proc:
                     os.killpg(proc.pid, signal.SIGTERM)
                 return self._json({"ok": True, "killed": bool(proc)})

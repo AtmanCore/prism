@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+import threading
 from types import SimpleNamespace
 
 import pytest
@@ -283,3 +284,274 @@ class TestKbRefNames:
     def test_rejects_option_like_or_odd_refs(self, srv, tmp_path, ref):
         with pytest.raises(ValueError, match="not a branch or tag name"):
             srv.sync_kb_repo(tmp_path, "org/repo", ref)
+
+
+class TestChatStartsFromCompactedReview:
+    """A new chat forks the run's compacted review session, falling back to a fresh one."""
+
+    RUN = "20260101-120000"
+
+    @pytest.fixture
+    def chat_pr(self, srv, monkeypatch):
+        pr = _pr(srv, title="t", url="u", head_ref="feat", base_ref="main")
+        run_dir = srv.REPORTS / KEY / self.RUN
+        run_dir.mkdir(parents=True)
+        (srv.PRS_DIR / KEY).mkdir(parents=True)
+        calls = []
+
+        def fake(wt, prompt, session, fork=False):
+            calls.append((session, fork))
+            return None if session == "gone" else {"result": "ok", "session_id": "chat-1"}
+        monkeypatch.setattr(srv, "run_chat_claude", fake)
+        monkeypatch.setattr(srv, "build_chat_prompt", lambda *a: "discuss")
+
+        def write(compacted="compact-1", head_sha=pr["head_sha"]):
+            meta = {"session_id": "review-1", "head_sha": head_sha}
+            (run_dir / "findings.json").write_text(json.dumps({"findings": [], "meta": meta}))
+            if compacted:
+                (run_dir / "session.json").write_text(json.dumps({"compacted": compacted}))
+        return write, calls
+
+    def test_first_message_forks_the_compacted_review(self, srv, chat_pr):
+        write, calls = chat_pr
+        write()
+        srv.chat_turn(KEY, self.RUN, "why F1?")
+        assert calls == [("compact-1", True)]
+        assert srv.load_chat(KEY)["sessions"][self.RUN] == "chat-1"
+
+    def test_follow_ups_resume_the_chat_not_the_review(self, srv, chat_pr):
+        write, calls = chat_pr
+        write()
+        srv.chat_turn(KEY, self.RUN, "why F1?")
+        srv.chat_turn(KEY, self.RUN, "and F2?")
+        assert calls[1] == ("chat-1", False)
+
+    def test_expired_chat_session_restarts_from_the_compacted_review(self, srv, chat_pr):
+        write, calls = chat_pr
+        write()
+        srv.chat_turn(KEY, self.RUN, "why F1?")
+        chat = srv.load_chat(KEY)
+        chat["sessions"][self.RUN] = "gone"
+        srv.save_chat(KEY, chat)
+        srv.chat_turn(KEY, self.RUN, "and F2?")
+        assert calls[1:] == [("gone", False), ("compact-1", True)]
+
+    @pytest.mark.parametrize("kw", [{"compacted": None}, {"head_sha": "b" * 40}])
+    def test_no_compaction_or_new_commits_starts_fresh(self, srv, chat_pr, kw):
+        write, calls = chat_pr
+        write(**kw)
+        srv.chat_turn(KEY, self.RUN, "why F1?")
+        assert calls == [(None, False)]
+
+    def test_corrupt_session_record_starts_fresh(self, srv, chat_pr):
+        write, calls = chat_pr
+        write()
+        (srv.REPORTS / KEY / self.RUN / "session.json").write_text("{not json")
+        srv.chat_turn(KEY, self.RUN, "why F1?")
+        assert calls == [(None, False)]
+
+    def test_unusable_compacted_session_falls_back(self, srv, chat_pr):
+        write, calls = chat_pr
+        write(compacted="gone")
+        srv.chat_turn(KEY, self.RUN, "why F1?")
+        assert calls == [("gone", True), (None, False)]
+
+
+class TestCompactReviewSession:
+    """Compacting a fork of the review session records it for chats and never raises."""
+
+    def _run(self, srv, tmp_path, monkeypatch, stdout):
+        seen = {"killed": []}
+
+        class FakeProc:
+            pid = 4242
+
+            def __init__(self, cmd, **kw):
+                seen.update(cmd=cmd, new_session=kw.get("start_new_session"))
+                self.calls = 0
+
+            def communicate(self, input=None, timeout=None):
+                self.calls += 1
+                if self.calls == 1:
+                    seen.update(input=input, timeout=timeout, registered=dict(srv.RUNNING_PROCS))
+                    if isinstance(stdout, Exception):
+                        raise stdout
+                return stdout, ""
+        monkeypatch.setattr(srv.subprocess, "Popen", FakeProc)
+        monkeypatch.setattr(srv.os, "killpg", lambda pid, sig: seen["killed"].append(pid))
+        srv.compact_review_session(KEY, tmp_path, "review-1", tmp_path)
+        return seen
+
+    def test_forks_and_records_the_compacted_session(self, srv, tmp_path, monkeypatch):
+        seen = self._run(srv, tmp_path, monkeypatch, json.dumps({"session_id": "compact-1", "total_cost_usd": 0.1}))
+        assert seen["input"].startswith("/compact ")
+        assert seen["cmd"][seen["cmd"].index("--resume") + 1] == "review-1" and "--fork-session" in seen["cmd"]
+        assert json.loads((tmp_path / "session.json").read_text())["compacted"] == "compact-1"
+
+    def test_process_is_killable_and_unregistered_after(self, srv, tmp_path, monkeypatch):
+        seen = self._run(srv, tmp_path, monkeypatch, json.dumps({"session_id": "compact-1"}))
+        assert seen["new_session"] is True and f"compact:{KEY}" in seen["registered"]
+        assert seen["timeout"] == srv.CONFIG["compact_timeout_sec"]
+        assert f"compact:{KEY}" not in srv.RUNNING_PROCS
+
+    def test_timeout_kills_the_process_group(self, srv, tmp_path, monkeypatch):
+        seen = self._run(srv, tmp_path, monkeypatch, subprocess.TimeoutExpired("claude", 180))
+        assert seen["killed"] == [4242] and f"compact:{KEY}" not in srv.RUNNING_PROCS
+        assert not (tmp_path / "session.json").exists()
+
+    def test_skipped_while_clearing(self, srv, tmp_path, monkeypatch):
+        srv.CLEARING.set()
+        assert "cmd" not in self._run(srv, tmp_path, monkeypatch, json.dumps({"session_id": "compact-1"}))
+
+    def test_write_failure_is_swallowed(self, srv, tmp_path, monkeypatch):
+        self._run(srv, tmp_path, monkeypatch, json.dumps({"session_id": "compact-1"}))
+        srv.compact_review_session(KEY, tmp_path, "review-1", tmp_path / "gone")
+
+    @pytest.mark.parametrize("model, expected", [(None, None), ("opus", "opus")])
+    def test_uses_the_review_model(self, srv, tmp_path, monkeypatch, model, expected):
+        srv.CONFIG["claude"]["model"] = model
+        cmd = self._run(srv, tmp_path, monkeypatch, json.dumps({"session_id": "compact-1"}))["cmd"]
+        assert (cmd[cmd.index("--model") + 1] if "--model" in cmd else None) == expected
+
+    @pytest.mark.parametrize("stdout", [
+        "not json",
+        json.dumps({"is_error": True, "session_id": "x"}),
+        json.dumps({"result": "done"}),
+        OSError("no claude"),
+    ])
+    def test_failure_is_swallowed(self, srv, tmp_path, monkeypatch, stdout):
+        self._run(srv, tmp_path, monkeypatch, stdout)
+        assert not (tmp_path / "session.json").exists()
+
+
+class TestRunChatClaudeFork:
+    """Forking only applies when resuming a session, so the review's own session is never extended."""
+
+    @pytest.mark.parametrize("session, fork, resume, forked", [
+        (None, False, None, False),
+        (None, True, None, False),
+        ("s-1", False, "s-1", False),
+        ("s-1", True, "s-1", True),
+    ])
+    def test_resume_and_fork_flags(self, srv, tmp_path, monkeypatch, session, fork, resume, forked):
+        seen = {}
+
+        def fake_run(cmd, **kw):
+            seen["cmd"] = cmd
+            return SimpleNamespace(stdout=json.dumps({"result": "ok", "session_id": "c"}), stderr="", returncode=0)
+        monkeypatch.setattr(srv.subprocess, "run", fake_run)
+        assert srv.run_chat_claude(tmp_path, "hi", session, fork=fork)["result"] == "ok"
+        cmd = seen["cmd"]
+        assert (cmd[cmd.index("--resume") + 1] if "--resume" in cmd else None) == resume
+        assert ("--fork-session" in cmd) is forked
+
+
+class TestReviewCompactsItsSession:
+    """A successful review records its session and compacts a copy unless disabled."""
+
+    @pytest.fixture
+    def run_review(self, srv, tmp_path, monkeypatch):
+        _pr(srv)
+        wt = tmp_path / "wt"
+        compacted = []
+        monkeypatch.setattr(srv, "prepare_worktree", lambda pr: wt)
+        monkeypatch.setattr(srv, "match_kbs", lambda pr: [])
+        monkeypatch.setattr(srv, "build_review_prompt", lambda *a: "review")
+        monkeypatch.setattr(srv, "start_compaction", lambda *a: compacted.append(a))
+
+        def run(result):
+            monkeypatch.setattr(srv, "run_claude", lambda *a: result)
+            srv._review(KEY, "test")
+            run_dir = next((srv.REPORTS / KEY).iterdir())
+            return wt, run_dir, compacted
+        return run
+
+    def test_compacts_a_successful_review(self, srv, run_review):
+        wt, run_dir, compacted = run_review({"result": "LGTM", "session_id": "review-1"})
+        assert compacted == [(KEY, run_dir.name, wt, "review-1", run_dir)]
+        assert json.loads((run_dir / "findings.json").read_text())["meta"]["session_id"] == "review-1"
+        assert srv.STORE.prs[KEY]["review_status"] == "done"
+
+    @pytest.mark.parametrize("result, enabled", [
+        ({"result": "LGTM", "session_id": "review-1"}, False),
+        ({"result": "LGTM", "session_id": "review-1", "is_error": True}, True),
+        ({"result": "", "session_id": "review-1"}, True),
+        ({"result": "LGTM"}, True),
+    ])
+    def test_skips_compaction(self, srv, run_review, result, enabled):
+        srv.CONFIG["compact_after_review"] = enabled
+        _, run_dir, compacted = run_review(result)
+        assert compacted == []
+        assert json.loads((run_dir / "findings.json").read_text())["meta"]["session_id"] == result.get("session_id")
+
+
+class TestRunChatClaudeFallback:
+    """A resumed session is dropped only when the session itself is the problem."""
+
+    @pytest.fixture
+    def run(self, srv, tmp_path, monkeypatch):
+        def go(session, stdout="", stderr="", exc=None):
+            def fake_run(cmd, **kw):
+                if exc:
+                    raise exc
+                return SimpleNamespace(stdout=stdout, stderr=stderr, returncode=1)
+            monkeypatch.setattr(srv.subprocess, "run", fake_run)
+            return srv.run_chat_claude(tmp_path, "hi", session)
+        return go
+
+    @pytest.mark.parametrize("stdout, stderr", [
+        ("", "No conversation found with session ID: s-1"),
+        (json.dumps({"is_error": True, "result": "Prompt is too long"}), ""),
+        (json.dumps({"is_error": True, "result": "input exceeds the context window"}), ""),
+    ])
+    def test_unusable_session_falls_back(self, run, stdout, stderr):
+        assert run("s-1", stdout, stderr) is None
+
+    def test_timeout_on_resume_falls_back(self, run):
+        assert run("s-1", exc=subprocess.TimeoutExpired("claude", 600)) is None
+
+    @pytest.mark.parametrize("session", ["s-1", None])
+    def test_other_errors_are_not_retried(self, run, session):
+        with pytest.raises(RuntimeError, match="rate limit"):
+            run(session, json.dumps({"is_error": True, "result": "x"}), "rate limit reached")
+
+    def test_timeout_without_session_raises(self, run):
+        with pytest.raises(subprocess.TimeoutExpired):
+            run(None, exc=subprocess.TimeoutExpired("claude", 600))
+
+
+class TestBackgroundCompaction:
+    """Compaction runs in its own thread and a chat that starts meanwhile waits for it."""
+
+    def test_runs_registered_and_signals_done(self, srv, tmp_path, monkeypatch):
+        release, seen = threading.Event(), []
+
+        def slow(*a):
+            seen.append((a, set(srv.BUSY)))
+            release.wait(5)
+        monkeypatch.setattr(srv, "compact_review_session", slow)
+        srv.start_compaction(KEY, "r1", tmp_path, "review-1", tmp_path)
+        done = srv.COMPACTING[(KEY, "r1")]
+        release.set()
+        srv.wait_for_compaction(KEY, "r1")
+        assert done.is_set() and (KEY, "r1") not in srv.COMPACTING
+        assert seen == [((KEY, tmp_path, "review-1", tmp_path), {f"compact:{KEY}:r1"})]
+
+    def test_refused_while_clearing(self, srv, tmp_path, monkeypatch):
+        called = []
+        monkeypatch.setattr(srv, "compact_review_session", lambda *a: called.append(a))
+        srv.CLEARING.set()
+        srv.start_compaction(KEY, "r1", tmp_path, "review-1", tmp_path)
+        srv.COMPACTING.get((KEY, "r1"), SimpleNamespace(wait=lambda t: None)).wait(5)
+        srv.wait_for_compaction(KEY, "r1")
+        assert called == []
+
+    def test_wait_without_compaction_returns_at_once(self, srv):
+        srv.wait_for_compaction(KEY, "none")
+
+    def test_flag_off_ignores_existing_compacted_session(self, srv, tmp_path):
+        (tmp_path / "session.json").write_text(json.dumps({"compacted": "compact-1"}))
+        pr, data = {"head_sha": "a"}, {"meta": {"head_sha": "a"}}
+        assert srv.compacted_review_session(pr, tmp_path, data) == "compact-1"
+        srv.CONFIG["compact_after_review"] = False
+        assert srv.compacted_review_session(pr, tmp_path, data) is None

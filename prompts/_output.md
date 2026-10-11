@@ -1,10 +1,7 @@
 # Final output (required, exact format)
-Your final message must contain exactly these two blocks and nothing else:
+Your final message must contain exactly this block and nothing else. No prose report: PRism
+renders the full report from this JSON, so writing one only repeats every finding.
 
-<<<REPORT
-(the merged PR REVIEW REPORT from the consistency reviewer, verbatim, plus a trailing
-"KNOWLEDGE-BASE REGRESSION" section if Phase KB ran)
-REPORT>>>
 <<<FINDINGS_JSON
 (one JSON object, valid JSON, no comments, no trailing commas, matching the schema below)
 FINDINGS_JSON>>>
@@ -27,6 +24,9 @@ JSON schema:
   "scope_filter": {{"dropped_out_of_scope": 0, "downgraded_medium_to_low": 0}},
   "ticket": {{"key": "ticket key linked from the PR, or null", "summary": "ticket summary or null"}},
   "counts": {{"critical": 0, "high": 0, "medium": 0, "low": 0}},
+  "previously_raised": [
+    {{"status": "resolved|expected|still-open", "ref": "path:line", "point": "short", "reason": "one line"}}
+  ],
   "ac_coverage": [
     {{"status": "covered|partial|missing|contradicts", "criterion": "ticket AC, or a change the PR description claims when no ticket is linked", "ref": "file:line or null", "note": "..."}}
   ],
