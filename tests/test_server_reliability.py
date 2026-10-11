@@ -742,9 +742,15 @@ class TestStopCompactions:
         (srv.REPOS_DIR / "org__repo.git").mkdir(parents=True)
         (srv.PRS_DIR / KEY).mkdir(parents=True)
         monkeypatch.setattr(srv, "stop_compactions", lambda key: order.append(("stop", key)))
-        monkeypatch.setattr(srv, "run", lambda cmd, **kw: order.append(tuple(cmd[:3])) or "")
-        with pytest.raises(Exception):
-            srv.prepare_worktree(pr)  # stops after the removal; the rest needs real git
+
+        def fake_run(cmd, **kw):
+            order.append(tuple(cmd[:3]))
+            if cmd[:3] == ["git", "worktree", "prune"]:
+                raise StopIteration  # the rest needs real git
+            return ""
+        monkeypatch.setattr(srv, "run", fake_run)
+        with pytest.raises(StopIteration):
+            srv.prepare_worktree(pr)
         assert order.index(("stop", KEY)) < order.index(("git", "worktree", "remove"))
 
     def test_cleanup_inactive_stops_them_before_removing(self, srv, monkeypatch):
