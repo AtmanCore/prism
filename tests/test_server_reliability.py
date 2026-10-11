@@ -711,3 +711,96 @@ class TestChatFailures:
         with pytest.raises(RuntimeError, match="boom"):
             srv.chat_turn(KEY, "20260101-120000", "why F1?")
         assert srv.load_chat(KEY)["sessions"] == {}
+
+
+class TestStopCompactions:
+    """A PR's compactions are stopped before its worktree is deleted or when its review is cancelled."""
+
+    @pytest.fixture
+    def compactions(self, srv, monkeypatch):
+        stopped, waited = [], []
+        monkeypatch.setattr(srv, "stop_process", lambda proc: stopped.append(proc.pid))
+        srv.COMPACT_PROCS.update({(KEY, "r1"): SimpleNamespace(pid=1), ("other__pr__1", "r1"): SimpleNamespace(pid=2)})
+        srv.COMPACTING.update({(KEY, "r1"): SimpleNamespace(wait=lambda t: waited.append(t)),
+                               ("other__pr__1", "r1"): SimpleNamespace(wait=lambda t: pytest.fail("other PR"))})
+        yield stopped, waited
+        srv.COMPACT_PROCS.clear()
+        srv.COMPACTING.clear()
+
+    def test_stops_only_that_prs_compactions(self, srv, compactions):
+        stopped, waited = compactions
+        srv.stop_compactions(KEY)
+        assert stopped == [1] and waited == [20]
+
+    def test_nothing_running(self, srv, monkeypatch):
+        monkeypatch.setattr(srv, "stop_process", lambda proc: pytest.fail("nothing to stop"))
+        srv.stop_compactions(KEY)
+
+    def test_prepare_worktree_stops_them_before_removing(self, srv, monkeypatch):
+        order = []
+        pr = _pr(srv, base_ref="main")
+        (srv.REPOS_DIR / "org__repo.git").mkdir(parents=True)
+        (srv.PRS_DIR / KEY).mkdir(parents=True)
+        monkeypatch.setattr(srv, "stop_compactions", lambda key: order.append(("stop", key)))
+        monkeypatch.setattr(srv, "run", lambda cmd, **kw: order.append(tuple(cmd[:3])) or "")
+        with pytest.raises(Exception):
+            srv.prepare_worktree(pr)  # stops after the removal; the rest needs real git
+        assert order.index(("stop", KEY)) < order.index(("git", "worktree", "remove"))
+
+    def test_cleanup_inactive_stops_them_before_removing(self, srv, monkeypatch):
+        order = []
+        _pr(srv, active=False)
+        (srv.PRS_DIR / KEY).mkdir(parents=True)
+        monkeypatch.setattr(srv, "stop_compactions", lambda key: order.append(("stop", key)))
+        monkeypatch.setattr(srv, "run", lambda cmd, **kw: order.append(tuple(cmd[:3])))
+        sleeps = iter([None])
+        monkeypatch.setattr(srv.time, "sleep", lambda s: next(sleeps))
+        with pytest.raises(StopIteration):
+            srv.cleanup_inactive()
+        assert order[:2] == [("stop", KEY), ("git", "worktree", "remove")]
+
+
+class TestCancelRoute:
+    """Cancel stops the PR's running review and, in the background, its compactions."""
+
+    def _cancel(self, srv, monkeypatch):
+        sent = {}
+        h = srv.Handler.__new__(srv.Handler)
+        h.path = f"/api/prs/{KEY}/cancel"
+        monkeypatch.setattr(h, "_local_host", lambda: True, raising=False)
+        monkeypatch.setattr(h, "_same_origin", lambda: True, raising=False)
+        monkeypatch.setattr(h, "_json", lambda body, status=None: sent.update(body), raising=False)
+        h.do_POST()
+        return sent
+
+    @pytest.mark.parametrize("review, compaction, killed", [
+        (True, False, True), (False, True, True), (True, True, True), (False, False, False)])
+    def test_cancel(self, srv, monkeypatch, review, compaction, killed):
+        _pr(srv)
+        signals, stopped = [], []
+        monkeypatch.setattr(srv.os, "killpg", lambda pid, sig: signals.append(pid))
+        monkeypatch.setattr(srv, "stop_compactions", lambda key: stopped.append(key))
+        monkeypatch.setattr(srv.threading, "Thread", lambda target, args, **kw: SimpleNamespace(
+            start=lambda: target(*args)))
+        if review:
+            srv.RUNNING_PROCS[KEY] = SimpleNamespace(pid=11)
+        if compaction:
+            srv.COMPACT_PROCS[(KEY, "r1")] = SimpleNamespace(pid=12)
+        try:
+            assert self._cancel(srv, monkeypatch) == {"ok": True, "killed": killed}
+        finally:
+            srv.RUNNING_PROCS.clear()
+            srv.COMPACT_PROCS.clear()
+        assert signals == ([11] if review else []) and stopped == ([KEY] if compaction else [])
+
+    def test_review_already_gone(self, srv, monkeypatch):
+        _pr(srv)
+
+        def gone(pid, sig):
+            raise ProcessLookupError
+        monkeypatch.setattr(srv.os, "killpg", gone)
+        srv.RUNNING_PROCS[KEY] = SimpleNamespace(pid=11)
+        try:
+            assert self._cancel(srv, monkeypatch)["killed"] is True
+        finally:
+            srv.RUNNING_PROCS.clear()

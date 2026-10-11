@@ -111,8 +111,24 @@ class TestTokenUsage:
             "claude-sonnet": {"input": 0, "output": 0, "cache_read": 0, "cache_write": 0, "cost_usd": None},
         }
 
-    def test_no_usage(self, srv):
-        assert srv.token_usage({}) == {}
+    @pytest.mark.parametrize("usage", [None, [], "x", {"claude-opus": "x"}])
+    def test_odd_usage_never_raises(self, srv, usage):
+        out = srv.token_usage({"modelUsage": usage})
+        assert out in ({}, {"claude-opus": {"input": 0, "output": 0, "cache_read": 0, "cache_write": 0,
+                                            "cost_usd": None}})
+
+    @pytest.mark.parametrize("body", ["[1, 2]", '"text"', "3"])
+    def test_review_with_non_object_json_is_recorded_as_unparsed(self, srv, tmp_path, monkeypatch, body):
+        srv.STORE.prs[KEY] = {"key": KEY, "repo": "org/repo", "number": 7, "head_sha": "a" * 40, "active": True}
+        monkeypatch.setattr(srv, "prepare_worktree", lambda pr: tmp_path)
+        monkeypatch.setattr(srv, "match_kbs", lambda pr: [])
+        monkeypatch.setattr(srv, "build_review_prompt", lambda *a: "review")
+        monkeypatch.setattr(srv, "start_compaction", lambda *a: None)
+        monkeypatch.setattr(srv, "run_claude", lambda *a: {"result": f"<<<FINDINGS_JSON\n{body}\nFINDINGS_JSON>>>"})
+        srv._review(KEY, "test")
+        run_dir = next((srv.REPORTS / KEY).iterdir())
+        assert json.loads((run_dir / "findings.json").read_text())["parse_error"] is True
+        assert srv.STORE.prs[KEY]["review_status"] == "done"
 
     def test_review_records_it(self, srv, tmp_path, monkeypatch):
         srv.STORE.prs[KEY] = {"key": KEY, "repo": "org/repo", "number": 7, "head_sha": "a" * 40, "active": True}

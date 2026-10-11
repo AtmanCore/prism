@@ -1220,6 +1220,7 @@ def prepare_worktree(pr: dict) -> Path:
              f"+refs/heads/{pr['base_ref']}:refs/remotes/origin/{pr['base_ref']}",
              f"+refs/pull/{pr['number']}/head:refs/remotes/origin/pr/{pr['number']}"], cwd=bare, timeout=1800)
         if wt.exists():
+            stop_compactions(pr["key"])  # they run in this worktree, outside the PR lock
             run(["git", "worktree", "remove", "--force", str(wt)], cwd=bare, check=False)
             shutil.rmtree(wt, ignore_errors=True)
         run(["git", "worktree", "prune"], cwd=bare, check=False)
@@ -1315,6 +1316,8 @@ def parse_output(text: str) -> tuple[str, dict | None]:
             findings = json.loads(raw)
         except json.JSONDecodeError:
             findings = None
+        if not isinstance(findings, dict):
+            findings = None  # e.g. a bare list: the review records it as unparsed instead of failing
     report = text.strip()
     if report_m:
         report = report_m.group(1).strip()
@@ -1401,7 +1404,8 @@ def render_report(f: dict) -> str:
 def token_usage(result: dict) -> dict:
     """Per-model token counts and API-price cost of one claude run, for the run's meta."""
     out = {}
-    for model, u in (result.get("modelUsage") or {}).items():
+    for model, u in _obj(result.get("modelUsage")).items():
+        u = _obj(u)
         out[model] = {"input": u.get("inputTokens", 0), "output": u.get("outputTokens", 0),
                       "cache_read": u.get("cacheReadInputTokens", 0),
                       "cache_write": u.get("cacheCreationInputTokens", 0), "cost_usd": u.get("costUSD")}
@@ -1554,6 +1558,7 @@ def cleanup_inactive() -> None:
                 wt = PRS_DIR / pr["key"]
                 if wt.exists():
                     bare = REPOS_DIR / f"{pr['repo'].replace('/', '__')}.git"
+                    stop_compactions(pr["key"])
                     run(["git", "worktree", "remove", "--force", str(wt)], cwd=bare, check=False)
                     shutil.rmtree(wt, ignore_errors=True)
             except Exception:
@@ -2467,6 +2472,17 @@ def start_compaction(key: str, run_id: str, wt: Path, session: str, run_dir: Pat
     threading.Thread(target=job, name=f"compact-{key}", daemon=True).start()
 
 
+def stop_compactions(key: str) -> None:
+    """Stop a PR's running compactions and wait for their threads, e.g. before its worktree is deleted.
+    The chats then start from the report."""
+    for (k, _), proc in list(COMPACT_PROCS.items()):
+        if k == key:
+            stop_process(proc)
+    for (k, _), done in list(COMPACTING.items()):
+        if k == key:
+            done.wait(20)
+
+
 COMPACTION_WAIT_SEC = 45  # a chat waits at most this long for a running compaction, then starts from the report
 
 
@@ -3144,14 +3160,16 @@ class Handler(BaseHTTPRequestHandler):
                     return self._json({"error": str(exc)}, HTTPStatus.CONFLICT)
                 return self._json(chat_payload(key))
             if action == "cancel":
-                procs = [p for k, p in list(COMPACT_PROCS.items()) if k[0] == key] + [RUNNING_PROCS.get(key)]
-                procs = [p for p in procs if p]
-                for proc in procs:
+                proc = RUNNING_PROCS.get(key)
+                compacting = any(k == key for k, _ in list(COMPACT_PROCS))
+                if proc:
                     try:
                         os.killpg(proc.pid, signal.SIGTERM)
                     except ProcessLookupError:
                         pass
-                return self._json({"ok": True, "killed": bool(procs)})
+                if compacting:
+                    threading.Thread(target=stop_compactions, args=(key,), daemon=True).start()
+                return self._json({"ok": True, "killed": bool(proc) or compacting})
         if len(parts) == 6 and parts[:2] == ["api", "prs"] and parts[3] == "decisions" and parts[5] == "undo":
             key = parts[2]
             if key not in STORE.prs:
