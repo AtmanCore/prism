@@ -54,6 +54,15 @@ class TestRenderReport:
         ):
             assert expected in report
 
+    @pytest.mark.parametrize("ticket, line", [
+        ({"key": "ABC-1", "summary": "Retry —"}, "Ticket: ABC-1 — Retry —"),
+        ({"key": "ABC-1", "summary": ""}, "Ticket: ABC-1\n"),
+        ({"key": "ABC-1"}, "Ticket: ABC-1\n"),
+        ({"summary": "orphan"}, "Ticket: none linked"),
+    ])
+    def test_ticket_line(self, srv, ticket, line):
+        assert line in srv.render_report({"ticket": ticket})
+
     def test_minimal_findings(self, srv):
         report = srv.render_report({})
         assert "Verdict: n/a" in report and "Ticket: none linked" in report

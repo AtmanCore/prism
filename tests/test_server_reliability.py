@@ -671,6 +671,14 @@ class TestStartCompactionRegistersFirst:
         srv.BUSY.clear()
         srv.COMPACTING.clear()
 
+    def test_thread_start_failure_releases_everything(self, srv, tmp_path, monkeypatch):
+        def no_threads():
+            raise RuntimeError("can't start new thread")
+        monkeypatch.setattr(srv.threading, "Thread", lambda target, **kw: SimpleNamespace(start=no_threads))
+        srv.COMPACT_STOPPED.add((KEY, "r1"))
+        srv.start_compaction(KEY, "r1", tmp_path, "review-1", tmp_path)
+        assert srv.BUSY == set() and (KEY, "r1") not in srv.COMPACTING and srv.COMPACT_STOPPED == set()
+
     def test_skipped_when_clearing(self, srv, tmp_path, monkeypatch):
         monkeypatch.setattr(srv.threading, "Thread", lambda **kw: pytest.fail("no thread while clearing"))
         srv.CLEARING.set()
@@ -714,27 +722,64 @@ class TestChatFailures:
 
 
 class TestStopCompactions:
-    """A PR's compactions are stopped before its worktree is deleted or when its review is cancelled."""
+    """A PR's compactions are signalled to stop (their own threads reap them) before its worktree is
+    deleted or when its review is cancelled."""
 
     @pytest.fixture
     def compactions(self, srv, monkeypatch):
-        stopped, waited = [], []
-        monkeypatch.setattr(srv, "stop_process", lambda proc: stopped.append(proc.pid))
-        srv.COMPACT_PROCS.update({(KEY, "r1"): SimpleNamespace(pid=1), ("other__pr__1", "r1"): SimpleNamespace(pid=2)})
-        srv.COMPACTING.update({(KEY, "r1"): SimpleNamespace(wait=lambda t: waited.append(t)),
-                               ("other__pr__1", "r1"): SimpleNamespace(wait=lambda t: pytest.fail("other PR"))})
-        yield stopped, waited
+        signals = []
+        monkeypatch.setattr(srv.os, "killpg", lambda pid, sig: signals.append((pid, sig)))
+        monkeypatch.setattr(srv, "stop_process", lambda proc: pytest.fail("only the owning thread reaps"))
+
+        def setup(finishes=True):
+            waits = []
+
+            def wait(t):
+                waits.append(t)
+                return finishes
+            srv.COMPACT_PROCS.update({(KEY, "r1"): SimpleNamespace(pid=1),
+                                      ("other__pr__1", "r1"): SimpleNamespace(pid=2)})
+            srv.COMPACTING.update({(KEY, "r1"): SimpleNamespace(wait=wait),
+                                   (KEY, "r2"): SimpleNamespace(wait=wait),
+                                   ("other__pr__1", "r1"): SimpleNamespace(wait=lambda t: pytest.fail("other PR"))})
+            return signals, waits
+        yield setup
         srv.COMPACT_PROCS.clear()
         srv.COMPACTING.clear()
+        srv.COMPACT_STOPPED.clear()
 
-    def test_stops_only_that_prs_compactions(self, srv, compactions):
-        stopped, waited = compactions
+    def test_signals_only_that_prs_compactions(self, srv, compactions):
+        signals, waits = compactions()
         srv.stop_compactions(KEY)
-        assert stopped == [1] and waited == [20]
+        assert signals == [(1, srv.signal.SIGTERM)] and waits == [10, 10]
+        assert srv.COMPACT_STOPPED == {(KEY, "r1"), (KEY, "r2")}
+
+    def test_escalates_to_sigkill_if_they_linger(self, srv, compactions):
+        signals, waits = compactions(finishes=False)
+        srv.stop_compactions(KEY)
+        assert signals == [(1, srv.signal.SIGTERM), (1, srv.signal.SIGKILL)]
+        assert waits == [10, 10, 10]
+
+    def test_already_exited_process_is_fine(self, srv, compactions, monkeypatch):
+        compactions()
+
+        def gone(pid, sig):
+            raise ProcessLookupError
+        monkeypatch.setattr(srv.os, "killpg", gone)
+        srv.stop_compactions(KEY)
 
     def test_nothing_running(self, srv, monkeypatch):
-        monkeypatch.setattr(srv, "stop_process", lambda proc: pytest.fail("nothing to stop"))
+        monkeypatch.setattr(srv.os, "killpg", lambda pid, sig: pytest.fail("nothing to signal"))
         srv.stop_compactions(KEY)
+
+    def test_stopped_compaction_never_launches(self, srv, tmp_path, monkeypatch):
+        monkeypatch.setattr(srv.subprocess, "Popen", lambda *a, **kw: pytest.fail("must not launch"))
+        srv.COMPACT_STOPPED.add((KEY, "r1"))
+        try:
+            srv.compact_review_session(KEY, "r1", tmp_path, "review-1", tmp_path)
+        finally:
+            srv.COMPACT_STOPPED.clear()
+        assert not (tmp_path / "session.json").exists()
 
     def test_prepare_worktree_stops_them_before_removing(self, srv, monkeypatch):
         order = []
@@ -791,12 +836,12 @@ class TestCancelRoute:
         if review:
             srv.RUNNING_PROCS[KEY] = SimpleNamespace(pid=11)
         if compaction:
-            srv.COMPACT_PROCS[(KEY, "r1")] = SimpleNamespace(pid=12)
+            srv.COMPACTING[(KEY, "r1")] = threading.Event()
         try:
             assert self._cancel(srv, monkeypatch) == {"ok": True, "killed": killed}
         finally:
             srv.RUNNING_PROCS.clear()
-            srv.COMPACT_PROCS.clear()
+            srv.COMPACTING.clear()
         assert signals == ([11] if review else []) and stopped == ([KEY] if compaction else [])
 
     def test_review_already_gone(self, srv, monkeypatch):

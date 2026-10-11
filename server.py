@@ -1182,11 +1182,15 @@ QUEUED_LOCK = threading.Lock()
 REPO_LOCKS: dict[str, threading.Lock] = {}
 RUNNING_PROCS: dict[str, subprocess.Popen] = {}  # running reviews, by PR key
 COMPACT_PROCS: dict[tuple[str, str], subprocess.Popen] = {}  # running compactions, by (key, run_id)
+COMPACT_STOPPED: set[tuple[str, str]] = set()  # compactions told to stop: they must not start a process
+COMPACT_LOCK = threading.Lock()  # guards COMPACT_PROCS and COMPACT_STOPPED together
 
 
 def all_procs() -> list[subprocess.Popen]:
     """Every claude process PRism started, so clear and shutdown can stop them all."""
-    return list(RUNNING_PROCS.values()) + list(COMPACT_PROCS.values())  # snapshots: other threads mutate them
+    with COMPACT_LOCK:
+        compactions = list(COMPACT_PROCS.values())
+    return list(RUNNING_PROCS.values()) + compactions  # snapshots: other threads mutate them
 
 
 def enqueue(key: str, reason: str) -> bool:
@@ -1348,9 +1352,10 @@ def render_report(f: dict) -> str:
     def lines(*parts):
         return [x for x in parts if x]
     ticket = _obj(f.get("ticket"))
-    out = lines(f"Verdict: {f.get('verdict') or 'n/a'}",
-                f"Ticket: {ticket.get('key')} — {ticket.get('summary') or ''}".rstrip(" —")
-                if ticket.get("key") else "Ticket: none linked",
+    ticket_line = "Ticket: none linked"
+    if ticket.get("key"):
+        ticket_line = f"Ticket: {ticket['key']}" + (f" — {ticket['summary']}" if ticket.get("summary") else "")
+    out = lines(f"Verdict: {f.get('verdict') or 'n/a'}", ticket_line,
                 f"Lint: {f['lint']}" if f.get("lint") else "", "", str(f.get("summary") or "").strip(), "")
     must = _objs(f.get("must_fix"))
     out.append("MUST FIX")
@@ -2462,25 +2467,44 @@ def start_compaction(key: str, run_id: str, wt: Path, session: str, run_dir: Pat
     done = threading.Event()
     COMPACTING[(key, run_id)] = done
 
+    def finish() -> None:
+        done.set()
+        COMPACTING.pop((key, run_id), None)
+        with COMPACT_LOCK:
+            COMPACT_STOPPED.discard((key, run_id))
+        job_busy.__exit__(None, None, None)
+
     def job() -> None:
         try:
             compact_review_session(key, run_id, wt, session, run_dir)
         finally:
-            done.set()
-            COMPACTING.pop((key, run_id), None)
-            job_busy.__exit__(None, None, None)
-    threading.Thread(target=job, name=f"compact-{key}", daemon=True).start()
+            finish()
+    try:
+        threading.Thread(target=job, name=f"compact-{key}", daemon=True).start()
+    except Exception:  # e.g. no threads left: skip compaction, chats start from the report
+        log.warning("could not start compaction for %s", key, exc_info=True)
+        finish()
 
 
 def stop_compactions(key: str) -> None:
     """Stop a PR's running compactions and wait for their threads, e.g. before its worktree is deleted.
     The chats then start from the report."""
-    for (k, _), proc in list(COMPACT_PROCS.items()):
-        if k == key:
-            stop_process(proc)
-    for (k, _), done in list(COMPACTING.items()):
-        if k == key:
-            done.wait(20)
+    def signal_all(sig) -> None:
+        with COMPACT_LOCK:
+            procs = [proc for (k, _), proc in COMPACT_PROCS.items() if k == key]
+        for proc in procs:
+            try:
+                os.killpg(proc.pid, sig)
+            except (ProcessLookupError, PermissionError):
+                pass
+    pending = [done for (k, _), done in list(COMPACTING.items()) if k == key]
+    with COMPACT_LOCK:  # one that hasn't launched its process yet now never will
+        COMPACT_STOPPED.update(tag for tag in list(COMPACTING) if tag[0] == key)
+    signal_all(signal.SIGTERM)  # signal only: the compaction's own thread reaps its process
+    if not all(done.wait(10) for done in pending):
+        signal_all(signal.SIGKILL)
+        for done in pending:
+            done.wait(10)
 
 
 COMPACTION_WAIT_SEC = 45  # a chat waits at most this long for a running compaction, then starts from the report
@@ -2514,11 +2538,12 @@ def compact_review_session(key: str, run_id: str, wt: Path, session: str, run_di
         cmd += ["--model", CONFIG["claude"]["model"]]
     tag = (key, run_id)  # in COMPACT_PROCS so cancel, clear and shutdown can kill it
     try:
-        if CLEARING.is_set():
-            return
-        proc = subprocess.Popen(cmd, cwd=wt, env=child_env(), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                stderr=subprocess.PIPE, text=True, start_new_session=True)
-        COMPACT_PROCS[tag] = proc
+        with COMPACT_LOCK:  # launch and register together, so a stop never misses the process
+            if CLEARING.is_set() or tag in COMPACT_STOPPED:
+                return
+            proc = subprocess.Popen(cmd, cwd=wt, env=child_env(), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                    stderr=subprocess.PIPE, text=True, start_new_session=True)
+            COMPACT_PROCS[tag] = proc
         try:
             if CLEARING.is_set():  # clearing started while the process was launching
                 stop_process(proc)
@@ -2528,7 +2553,8 @@ def compact_review_session(key: str, run_id: str, wt: Path, session: str, run_di
             stop_process(proc)
             raise
         finally:
-            COMPACT_PROCS.pop(tag, None)
+            with COMPACT_LOCK:
+                COMPACT_PROCS.pop(tag, None)
         out = json.loads(stdout)
         if out.get("is_error") or not out.get("session_id"):
             raise RuntimeError((stderr or stdout).strip()[-300:])
@@ -3161,7 +3187,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(chat_payload(key))
             if action == "cancel":
                 proc = RUNNING_PROCS.get(key)
-                compacting = any(k == key for k, _ in list(COMPACT_PROCS))
+                compacting = any(k == key for k, _ in list(COMPACTING))
                 if proc:
                     try:
                         os.killpg(proc.pid, signal.SIGTERM)
