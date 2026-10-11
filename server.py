@@ -1068,7 +1068,7 @@ def clear_local_data(confirm: str) -> dict:
         cancelled = len(ACTIVE_REVIEWS)
         deadline = time.time() + 90
         while (ACTIVE_REVIEWS or BUSY) and time.time() < deadline:
-            for proc in list(RUNNING_PROCS.values()):
+            for proc in all_procs():
                 try:
                     os.killpg(proc.pid, signal.SIGTERM)
                 except (ProcessLookupError, PermissionError):
@@ -1180,7 +1180,13 @@ JOBS: "queue.Queue[tuple[str, str]]" = queue.Queue()
 QUEUED: set[str] = set()
 QUEUED_LOCK = threading.Lock()
 REPO_LOCKS: dict[str, threading.Lock] = {}
-RUNNING_PROCS: dict[str, subprocess.Popen] = {}
+RUNNING_PROCS: dict[str, subprocess.Popen] = {}  # running reviews, by PR key
+COMPACT_PROCS: dict[tuple[str, str], subprocess.Popen] = {}  # running compactions, by (key, run_id)
+
+
+def all_procs() -> list[subprocess.Popen]:
+    """Every claude process PRism started, so clear and shutdown can stop them all."""
+    return [*RUNNING_PROCS.values(), *COMPACT_PROCS.values()]
 
 
 def enqueue(key: str, reason: str) -> bool:
@@ -1309,12 +1315,14 @@ def parse_output(text: str) -> tuple[str, dict | None]:
             findings = json.loads(raw)
         except json.JSONDecodeError:
             findings = None
+    report = text.strip()
     if report_m:
         report = report_m.group(1).strip()
     elif isinstance(findings, dict):
-        report = render_report(findings)
-    else:
-        report = text.strip()
+        try:
+            report = render_report(findings)
+        except Exception:  # odd field types from the model: keep the raw text rather than fail the review
+            log.warning("could not render the report from the findings JSON", exc_info=True)
     return report, findings
 
 
@@ -1447,15 +1455,16 @@ def _review(key: str, reason: str) -> None:
         }
         (run_dir / "findings.json").write_text(json.dumps({**findings, "meta": meta}, indent=1))
         failed = bool(result.get("is_error")) or not text
+        if not failed and result.get("session_id") and CONFIG.get("compact_after_review", True):
+            start_compaction(key, run_id, wt, result["session_id"], run_dir)  # before "done": a chat then waits
+        ticket = findings.get("ticket")
         STORE.update_pr(
             key, review_status="failed" if failed else "done", reviewed_sha=pr["head_sha"],
             last_run=run_id, last_reviewed_at=now_iso(), outdated=False, seen_run=None,
             counts=findings["counts"], verdict=findings.get("verdict"),
-            ticket=(findings.get("ticket") or {}).get("key"),
+            ticket=ticket.get("key") if isinstance(ticket, dict) else None,
             error=(text[:500] if failed else None), progress=None,
         )
-        if not failed and result.get("session_id") and CONFIG.get("compact_after_review", True):
-            start_compaction(key, run_id, wt, result["session_id"], run_dir)
     except Exception as exc:
         log.exception("review of %s failed", key)
         (run_dir / "error.txt").write_text(str(exc))
@@ -2432,7 +2441,7 @@ def start_compaction(key: str, run_id: str, wt: Path, session: str, run_dir: Pat
     def job() -> None:
         try:
             with busy(f"compact:{key}:{run_id}"):
-                compact_review_session(key, wt, session, run_dir)
+                compact_review_session(key, run_id, wt, session, run_dir)
         except ClearingNow:
             pass
         finally:
@@ -2447,32 +2456,36 @@ def wait_for_compaction(key: str, run_id: str) -> None:
         done.wait(CONFIG["compact_timeout_sec"] + 5)
 
 
-def compact_review_session(key: str, wt: Path, session: str, run_dir: Path) -> None:
+def compact_review_session(key: str, run_id: str, wt: Path, session: str, run_dir: Path) -> None:
     """Compact a copy of the finished review's session for chats. Best effort: never raises."""
     cmd = [CONFIG["claude"]["bin"], "-p", "--setting-sources", "user", "--output-format", "json", "--tools", "",
            "--resume", session, "--fork-session"]
     if CONFIG["claude"].get("model"):
         cmd += ["--model", CONFIG["claude"]["model"]]
-    tag = f"compact:{key}"  # in RUNNING_PROCS so cancel, clear and restart can kill it
+    tag = (key, run_id)  # in COMPACT_PROCS so cancel, clear and shutdown can kill it
     try:
         if CLEARING.is_set():
             return
         proc = subprocess.Popen(cmd, cwd=wt, env=child_env(), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                 stderr=subprocess.PIPE, text=True, start_new_session=True)
-        RUNNING_PROCS[tag] = proc
+        COMPACT_PROCS[tag] = proc
         try:
             stdout, stderr = proc.communicate(COMPACT_PROMPT, timeout=CONFIG["compact_timeout_sec"])
         except subprocess.TimeoutExpired:
             os.killpg(proc.pid, signal.SIGTERM)
-            proc.communicate()
+            try:
+                proc.communicate(timeout=10)
+            except subprocess.TimeoutExpired:
+                os.killpg(proc.pid, signal.SIGKILL)
             raise
         finally:
-            RUNNING_PROCS.pop(tag, None)
+            COMPACT_PROCS.pop(tag, None)
         out = json.loads(stdout)
         if out.get("is_error") or not out.get("session_id"):
             raise RuntimeError((stderr or stdout).strip()[-300:])
         (run_dir / "session.json").write_text(json.dumps(
-            {"compacted": out["session_id"], "cost_usd": out.get("total_cost_usd"), "at": now_iso()}))
+            {"compacted": out["session_id"], "cost_usd": out.get("total_cost_usd"),
+             "model_usage": token_usage(out), "at": now_iso()}))
     except Exception as exc:  # chats fall back to starting from the report
         log.warning("compacting review session %s failed: %s", session, exc)
 
@@ -2510,8 +2523,8 @@ def run_chat_claude(wt: Path, prompt: str, session: str | None, fork: bool = Fal
         proc = subprocess.run(cmd, input=prompt, capture_output=True, text=True, cwd=wt, env=child_env(),
                               timeout=CONFIG["chat_timeout_sec"])
     except subprocess.TimeoutExpired:
-        if session:
-            return None  # resuming a large session timed out: caller starts a fresh one
+        if session and fork:
+            return None  # the compacted review was too slow to resume: caller starts from the report
         raise
     try:
         out = json.loads(proc.stdout)
@@ -3091,10 +3104,14 @@ class Handler(BaseHTTPRequestHandler):
                     return self._json({"error": str(exc)}, HTTPStatus.CONFLICT)
                 return self._json(chat_payload(key))
             if action == "cancel":
-                proc = RUNNING_PROCS.get(key) or RUNNING_PROCS.get(f"compact:{key}")
-                if proc:
-                    os.killpg(proc.pid, signal.SIGTERM)
-                return self._json({"ok": True, "killed": bool(proc)})
+                procs = [p for k, p in COMPACT_PROCS.items() if k[0] == key] + [RUNNING_PROCS.get(key)]
+                procs = [p for p in procs if p]
+                for proc in procs:
+                    try:
+                        os.killpg(proc.pid, signal.SIGTERM)
+                    except ProcessLookupError:
+                        pass
+                return self._json({"ok": True, "killed": bool(procs)})
         if len(parts) == 6 and parts[:2] == ["api", "prs"] and parts[3] == "decisions" and parts[5] == "undo":
             key = parts[2]
             if key not in STORE.prs:
@@ -3147,7 +3164,7 @@ def main() -> None:
     except KeyboardInterrupt:
         pass
     finally:
-        for proc in list(RUNNING_PROCS.values()):
+        for proc in all_procs():
             try:
                 os.killpg(proc.pid, signal.SIGTERM)
             except ProcessLookupError:

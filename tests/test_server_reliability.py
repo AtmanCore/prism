@@ -360,7 +360,7 @@ class TestChatStartsFromCompactedReview:
 class TestCompactReviewSession:
     """Compacting a fork of the review session records it for chats and never raises."""
 
-    def _run(self, srv, tmp_path, monkeypatch, stdout):
+    def _run(self, srv, tmp_path, monkeypatch, stdout, hang_after_kill=False):
         seen = {"killed": []}
 
         class FakeProc:
@@ -373,13 +373,16 @@ class TestCompactReviewSession:
             def communicate(self, input=None, timeout=None):
                 self.calls += 1
                 if self.calls == 1:
-                    seen.update(input=input, timeout=timeout, registered=dict(srv.RUNNING_PROCS))
+                    seen.update(input=input, timeout=timeout, registered=dict(srv.COMPACT_PROCS))
                     if isinstance(stdout, Exception):
                         raise stdout
+                elif hang_after_kill:
+                    seen["second_timeout"] = timeout
+                    raise subprocess.TimeoutExpired("claude", timeout)
                 return stdout, ""
         monkeypatch.setattr(srv.subprocess, "Popen", FakeProc)
-        monkeypatch.setattr(srv.os, "killpg", lambda pid, sig: seen["killed"].append(pid))
-        srv.compact_review_session(KEY, tmp_path, "review-1", tmp_path)
+        monkeypatch.setattr(srv.os, "killpg", lambda pid, sig: seen["killed"].append((pid, sig)))
+        srv.compact_review_session(KEY, "r1", tmp_path, "review-1", tmp_path)
         return seen
 
     def test_forks_and_records_the_compacted_session(self, srv, tmp_path, monkeypatch):
@@ -388,16 +391,26 @@ class TestCompactReviewSession:
         assert seen["cmd"][seen["cmd"].index("--resume") + 1] == "review-1" and "--fork-session" in seen["cmd"]
         assert json.loads((tmp_path / "session.json").read_text())["compacted"] == "compact-1"
 
+    def test_records_compaction_usage(self, srv, tmp_path, monkeypatch):
+        out = {"session_id": "compact-1", "modelUsage": {"claude-opus": {"outputTokens": 800}}}
+        self._run(srv, tmp_path, monkeypatch, json.dumps(out))
+        assert json.loads((tmp_path / "session.json").read_text())["model_usage"]["claude-opus"]["output"] == 800
+
     def test_process_is_killable_and_unregistered_after(self, srv, tmp_path, monkeypatch):
         seen = self._run(srv, tmp_path, monkeypatch, json.dumps({"session_id": "compact-1"}))
-        assert seen["new_session"] is True and f"compact:{KEY}" in seen["registered"]
+        assert seen["new_session"] is True and (KEY, "r1") in seen["registered"]
         assert seen["timeout"] == srv.CONFIG["compact_timeout_sec"]
-        assert f"compact:{KEY}" not in srv.RUNNING_PROCS
+        assert (KEY, "r1") not in srv.COMPACT_PROCS and srv.RUNNING_PROCS == {}
 
     def test_timeout_kills_the_process_group(self, srv, tmp_path, monkeypatch):
         seen = self._run(srv, tmp_path, monkeypatch, subprocess.TimeoutExpired("claude", 180))
-        assert seen["killed"] == [4242] and f"compact:{KEY}" not in srv.RUNNING_PROCS
+        assert seen["killed"] == [(4242, srv.signal.SIGTERM)] and (KEY, "r1") not in srv.COMPACT_PROCS
         assert not (tmp_path / "session.json").exists()
+
+    def test_process_that_ignores_sigterm_is_killed(self, srv, tmp_path, monkeypatch):
+        seen = self._run(srv, tmp_path, monkeypatch, subprocess.TimeoutExpired("claude", 180), hang_after_kill=True)
+        assert seen["second_timeout"] == 10
+        assert seen["killed"] == [(4242, srv.signal.SIGTERM), (4242, srv.signal.SIGKILL)]
 
     def test_skipped_while_clearing(self, srv, tmp_path, monkeypatch):
         srv.CLEARING.set()
@@ -405,7 +418,7 @@ class TestCompactReviewSession:
 
     def test_write_failure_is_swallowed(self, srv, tmp_path, monkeypatch):
         self._run(srv, tmp_path, monkeypatch, json.dumps({"session_id": "compact-1"}))
-        srv.compact_review_session(KEY, tmp_path, "review-1", tmp_path / "gone")
+        srv.compact_review_session(KEY, "r1", tmp_path, "review-1", tmp_path / "gone")
 
     @pytest.mark.parametrize("model, expected", [(None, None), ("opus", "opus")])
     def test_uses_the_review_model(self, srv, tmp_path, monkeypatch, model, expected):
@@ -466,6 +479,20 @@ class TestReviewCompactsItsSession:
             return wt, run_dir, compacted
         return run
 
+    def test_compaction_is_registered_before_the_review_shows_done(self, srv, run_review, monkeypatch):
+        status_at_start = []
+        monkeypatch.setattr(srv, "start_compaction",
+                            lambda *a: status_at_start.append(srv.STORE.prs[KEY].get("review_status")))
+        run_review({"result": "LGTM", "session_id": "review-1"})
+        assert status_at_start and status_at_start[0] != "done"
+        assert srv.STORE.prs[KEY]["review_status"] == "done"
+
+    @pytest.mark.parametrize("ticket, expected", [({"key": "ABC-1"}, "ABC-1"), ("ABC-1", None), (None, None)])
+    def test_odd_ticket_values_never_fail_the_review(self, srv, run_review, ticket, expected):
+        text = "<<<FINDINGS_JSON\n" + json.dumps({"ticket": ticket}) + "\nFINDINGS_JSON>>>"
+        run_review({"result": text, "session_id": "review-1"})
+        assert srv.STORE.prs[KEY]["review_status"] == "done" and srv.STORE.prs[KEY]["ticket"] == expected
+
     def test_compacts_a_successful_review(self, srv, run_review):
         wt, run_dir, compacted = run_review({"result": "LGTM", "session_id": "review-1"})
         assert compacted == [(KEY, run_dir.name, wt, "review-1", run_dir)]
@@ -490,13 +517,13 @@ class TestRunChatClaudeFallback:
 
     @pytest.fixture
     def run(self, srv, tmp_path, monkeypatch):
-        def go(session, stdout="", stderr="", exc=None):
+        def go(session, stdout="", stderr="", exc=None, fork=False):
             def fake_run(cmd, **kw):
                 if exc:
                     raise exc
                 return SimpleNamespace(stdout=stdout, stderr=stderr, returncode=1)
             monkeypatch.setattr(srv.subprocess, "run", fake_run)
-            return srv.run_chat_claude(tmp_path, "hi", session)
+            return srv.run_chat_claude(tmp_path, "hi", session, fork=fork)
         return go
 
     @pytest.mark.parametrize("stdout, stderr", [
@@ -507,17 +534,19 @@ class TestRunChatClaudeFallback:
     def test_unusable_session_falls_back(self, run, stdout, stderr):
         assert run("s-1", stdout, stderr) is None
 
-    def test_timeout_on_resume_falls_back(self, run):
-        assert run("s-1", exc=subprocess.TimeoutExpired("claude", 600)) is None
+    def test_timeout_resuming_the_compacted_review_falls_back(self, run):
+        assert run("s-1", exc=subprocess.TimeoutExpired("claude", 600), fork=True) is None
+
+    @pytest.mark.parametrize("session", ["s-1", None])
+    def test_timeout_mid_chat_raises(self, run, session):
+        with pytest.raises(subprocess.TimeoutExpired):
+            run(session, exc=subprocess.TimeoutExpired("claude", 600))
 
     @pytest.mark.parametrize("session", ["s-1", None])
     def test_other_errors_are_not_retried(self, run, session):
         with pytest.raises(RuntimeError, match="rate limit"):
             run(session, json.dumps({"is_error": True, "result": "x"}), "rate limit reached")
 
-    def test_timeout_without_session_raises(self, run):
-        with pytest.raises(subprocess.TimeoutExpired):
-            run(None, exc=subprocess.TimeoutExpired("claude", 600))
 
 
 class TestBackgroundCompaction:
@@ -535,7 +564,7 @@ class TestBackgroundCompaction:
         release.set()
         srv.wait_for_compaction(KEY, "r1")
         assert done.is_set() and (KEY, "r1") not in srv.COMPACTING
-        assert seen == [((KEY, tmp_path, "review-1", tmp_path), {f"compact:{KEY}:r1"})]
+        assert seen == [((KEY, "r1", tmp_path, "review-1", tmp_path), {f"compact:{KEY}:r1"})]
 
     def test_refused_while_clearing(self, srv, tmp_path, monkeypatch):
         called = []
@@ -555,3 +584,15 @@ class TestBackgroundCompaction:
         assert srv.compacted_review_session(pr, tmp_path, data) == "compact-1"
         srv.CONFIG["compact_after_review"] = False
         assert srv.compacted_review_session(pr, tmp_path, data) is None
+
+
+class TestAllProcs:
+    def test_lists_reviews_and_compactions(self, srv):
+        review, compaction = SimpleNamespace(pid=1), SimpleNamespace(pid=2)
+        srv.RUNNING_PROCS[KEY] = review
+        srv.COMPACT_PROCS[(KEY, "r1")] = compaction
+        try:
+            assert srv.all_procs() == [review, compaction]
+        finally:
+            srv.RUNNING_PROCS.clear()
+            srv.COMPACT_PROCS.clear()
