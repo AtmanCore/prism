@@ -1186,7 +1186,7 @@ COMPACT_PROCS: dict[tuple[str, str], subprocess.Popen] = {}  # running compactio
 
 def all_procs() -> list[subprocess.Popen]:
     """Every claude process PRism started, so clear and shutdown can stop them all."""
-    return [*RUNNING_PROCS.values(), *COMPACT_PROCS.values()]
+    return list(RUNNING_PROCS.values()) + list(COMPACT_PROCS.values())  # snapshots: other threads mutate them
 
 
 def enqueue(key: str, reason: str) -> bool:
@@ -1326,16 +1326,30 @@ def parse_output(text: str) -> tuple[str, dict | None]:
     return report, findings
 
 
+def _obj(v) -> dict:
+    return v if isinstance(v, dict) else {}
+
+
+def _objs(v) -> list[dict]:
+    """The dict items of a list from the model's JSON; anything else is skipped."""
+    return [x for x in v if isinstance(x, dict)] if isinstance(v, list) else []
+
+
+def _strs(v) -> list[str]:
+    return [str(x) for x in v] if isinstance(v, list) else []
+
+
 def render_report(f: dict) -> str:
-    """The plain-text "Full report" for a review, built from its findings JSON."""
+    """The plain-text "Full report" for a review, built from its findings JSON. Odd field types from the
+    model drop only that field or item, not the report."""
     def lines(*parts):
         return [x for x in parts if x]
-    ticket = f.get("ticket") or {}
+    ticket = _obj(f.get("ticket"))
     out = lines(f"Verdict: {f.get('verdict') or 'n/a'}",
                 f"Ticket: {ticket.get('key')} — {ticket.get('summary') or ''}".rstrip(" —")
                 if ticket.get("key") else "Ticket: none linked",
                 f"Lint: {f['lint']}" if f.get("lint") else "", "", str(f.get("summary") or "").strip(), "")
-    must = f.get("must_fix") or []
+    must = _objs(f.get("must_fix"))
     out.append("MUST FIX")
     for i, m in enumerate(must, 1):
         out += [f"{i}. [{str(m.get('severity', '')).upper()}] {m.get('title', '')} ({m.get('ref') or 'n/a'})",
@@ -1343,20 +1357,21 @@ def render_report(f: dict) -> str:
                 f"   Fix: {m.get('fix', '')}", f"   Importance: {m.get('importance', '')}"]
     if not must:
         out.append("None. Nothing blocks this PR.")
-    flow = f.get("flow_context") or {}
+    flow = _obj(f.get("flow_context"))
     if flow.get("summary"):
         out += ["", "FLOW CONTEXT", str(flow["summary"]).strip(), f"Source: {flow.get('source') or 'n/a'}"]
-    prev = f.get("previously_raised") or []
+    prev = _objs(f.get("previously_raised"))
     if prev:
         out += ["", "PREVIOUSLY RAISED"]
         out += [f"- [{p.get('status')}] {p.get('ref')}: {p.get('point')}. {p.get('reason') or ''}".rstrip()
                 for p in prev]
-    ac = f.get("ac_coverage") or []
+    ac = _objs(f.get("ac_coverage"))
     if ac:
         out += ["", "AC / SPEC CONSISTENCY"]
         out += [f"- [{a.get('status')}] {a.get('criterion')} → {a.get('ref') or 'n/a'}"
                 + (f" ({a['note']})" if a.get("note") else "") for a in ac]
-    for x in f.get("findings") or []:
+    items = _objs(f.get("findings"))
+    for x in items:
         out += ["", f"[{str(x.get('severity', '')).upper()}] {x.get('id', '')} {x.get('title', '')}".rstrip(),
                 f"Source: {x.get('source') or 'n/a'}   Scope: {x.get('scope') or 'n/a'}   "
                 f"Category: {x.get('category') or 'n/a'}",
@@ -1364,23 +1379,22 @@ def render_report(f: dict) -> str:
         out += [f"{label}: {x[k]}" for k, label in (("why", "Why"), ("impact", "Impact"), ("fix", "Fix"))
                 if x.get(k)]
         out.append("---")
-    kb = f.get("kb_regression") or {}
+    kb = _obj(f.get("kb_regression"))
     if kb.get("ran"):
         out += ["", "KNOWLEDGE-BASE REGRESSION", str(kb.get("summary") or "").strip()]
-        out += [f"- checked: {c}" for c in kb.get("checked") or []]
-    items = f.get("findings") or []
+        out += [f"- checked: {c}" for c in _strs(kb.get("checked"))]
     counts = {s: sum(1 for x in items if str(x.get("severity", "")).lower() == s) for s in SEVERITIES}
-    scope = f.get("scope_filter") or {}
+    scope = _obj(f.get("scope_filter"))
     out += ["", "SUMMARY",
             "- " + "  ".join(f"{s.capitalize()} {counts.get(s, 0)}" for s in SEVERITIES),
             f"- Dropped as out-of-scope: {scope.get('dropped_out_of_scope', 0)}   "
             f"Downgraded: {scope.get('downgraded_medium_to_low', 0)}"]
-    if f.get("top_priorities"):
-        out += ["", "TOP PRIORITIES"] + [f"{i}. {t}" for i, t in enumerate(f["top_priorities"], 1)]
+    if _strs(f.get("top_priorities")):
+        out += ["", "TOP PRIORITIES"] + [f"{i}. {t}" for i, t in enumerate(_strs(f["top_priorities"]), 1)]
     if f.get("residual_risk"):
         out += ["", f"RESIDUAL RISK: {f['residual_risk']}"]
-    if f.get("not_validated"):
-        out += [f"AREAS NOT FULLY VALIDATED: {'; '.join(map(str, f['not_validated']))}"]
+    if _strs(f.get("not_validated")):
+        out += [f"AREAS NOT FULLY VALIDATED: {'; '.join(_strs(f['not_validated']))}"]
     return "\n".join(out).strip() + "\n"
 
 
@@ -1398,7 +1412,7 @@ SEVERITIES = ("critical", "high", "medium", "low")
 
 
 def normalize_findings(f: dict) -> dict:
-    items = f.get("findings") or []
+    items = _objs(f.get("findings"))
     for i, item in enumerate(items, 1):
         item.setdefault("id", f"F{i}")
         item["severity"] = str(item.get("severity", "low")).lower()
@@ -2435,25 +2449,45 @@ COMPACTING: dict[tuple[str, str], threading.Event] = {}  # (key, run_id) -> set 
 def start_compaction(key: str, run_id: str, wt: Path, session: str, run_dir: Path) -> None:
     """Compact the review's session in its own thread, outside the PR lock and the review worker slot.
     A chat that starts meanwhile waits for it (see wait_for_compaction)."""
+    job_busy = busy(f"compact:{key}:{run_id}")
+    try:
+        job_busy.__enter__()  # registered before the thread starts, so "Clear local data" always waits for it
+    except ClearingNow:
+        return
     done = threading.Event()
     COMPACTING[(key, run_id)] = done
 
     def job() -> None:
         try:
-            with busy(f"compact:{key}:{run_id}"):
-                compact_review_session(key, run_id, wt, session, run_dir)
-        except ClearingNow:
-            pass
+            compact_review_session(key, run_id, wt, session, run_dir)
         finally:
             done.set()
             COMPACTING.pop((key, run_id), None)
+            job_busy.__exit__(None, None, None)
     threading.Thread(target=job, name=f"compact-{key}", daemon=True).start()
+
+
+COMPACTION_WAIT_SEC = 45  # a chat waits at most this long for a running compaction, then starts from the report
 
 
 def wait_for_compaction(key: str, run_id: str) -> None:
     done = COMPACTING.get((key, run_id))
     if done:
-        done.wait(CONFIG["compact_timeout_sec"] + 5)
+        done.wait(COMPACTION_WAIT_SEC)
+
+
+def stop_process(proc: subprocess.Popen) -> None:
+    """SIGTERM the process group, SIGKILL it if it lingers, and reap it."""
+    for sig, wait in ((signal.SIGTERM, 10), (signal.SIGKILL, 5)):
+        try:
+            os.killpg(proc.pid, sig)
+        except (ProcessLookupError, PermissionError):
+            pass
+        try:
+            proc.communicate(timeout=wait)
+            return
+        except (subprocess.TimeoutExpired, ValueError):
+            continue
 
 
 def compact_review_session(key: str, run_id: str, wt: Path, session: str, run_dir: Path) -> None:
@@ -2470,13 +2504,12 @@ def compact_review_session(key: str, run_id: str, wt: Path, session: str, run_di
                                 stderr=subprocess.PIPE, text=True, start_new_session=True)
         COMPACT_PROCS[tag] = proc
         try:
-            stdout, stderr = proc.communicate(COMPACT_PROMPT, timeout=CONFIG["compact_timeout_sec"])
+            if CLEARING.is_set():  # clearing started while the process was launching
+                stop_process(proc)
+                return
+            stdout, stderr = proc.communicate(COMPACT_PROMPT, timeout=int(CONFIG["compact_timeout_sec"]))
         except subprocess.TimeoutExpired:
-            os.killpg(proc.pid, signal.SIGTERM)
-            try:
-                proc.communicate(timeout=10)
-            except subprocess.TimeoutExpired:
-                os.killpg(proc.pid, signal.SIGKILL)
+            stop_process(proc)
             raise
         finally:
             COMPACT_PROCS.pop(tag, None)
@@ -2524,7 +2557,7 @@ def run_chat_claude(wt: Path, prompt: str, session: str | None, fork: bool = Fal
                               timeout=CONFIG["chat_timeout_sec"])
     except subprocess.TimeoutExpired:
         if session and fork:
-            return None  # the compacted review was too slow to resume: caller starts from the report
+            return None  # starting from the compacted review is optional: caller starts from the report
         raise
     try:
         out = json.loads(proc.stdout)
@@ -2532,8 +2565,8 @@ def run_chat_claude(wt: Path, prompt: str, session: str | None, fork: bool = Fal
         out = None
     if not out or out.get("is_error") or not out.get("result"):
         detail = f"{proc.stderr}\n{proc.stdout}\n{(out or {}).get('result') or ''}"
-        if session and SESSION_UNUSABLE_RE.search(detail):
-            return None  # session gone or too big: caller starts a fresh one
+        if session and (fork or SESSION_UNUSABLE_RE.search(detail)):
+            return None  # fork failed, or the session is gone or too big: caller starts a fresh one
         raise RuntimeError((proc.stderr or proc.stdout or "no output").strip()[-600:])
     return out
 
@@ -2596,7 +2629,14 @@ def _chat_turn(key: str, run_id: str, message: str, pr: dict, run_dir: Path, dat
     note = ("[Since your last reply the reviewer applied:\n" + "\n".join(map(decision_line, fresh)) + "]\n\n"
             if fresh else "")
     session = chat["sessions"].get(run_id)
-    out = run_chat_claude(wt, note + message, session) if session else None
+    try:
+        out = run_chat_claude(wt, note + message, session) if session else None
+    except Exception:
+        with DECISION_LOCK:  # drop the session: the next message rebuilds it from the review and a recap
+            chat = load_chat(key)
+            chat["sessions"].pop(run_id, None)
+            save_chat(key, chat)
+        raise
     if out is None:
         recap = "\n".join(f"{'Reviewer' if m['role'] == 'you' else 'You'}: {m['text'][:400]}" for m in mine[-8:])
         prompt = build_chat_prompt(pr, key, run_id, data)
@@ -3104,7 +3144,7 @@ class Handler(BaseHTTPRequestHandler):
                     return self._json({"error": str(exc)}, HTTPStatus.CONFLICT)
                 return self._json(chat_payload(key))
             if action == "cancel":
-                procs = [p for k, p in COMPACT_PROCS.items() if k[0] == key] + [RUNNING_PROCS.get(key)]
+                procs = [p for k, p in list(COMPACT_PROCS.items()) if k[0] == key] + [RUNNING_PROCS.get(key)]
                 procs = [p for p in procs if p]
                 for proc in procs:
                     try:

@@ -409,8 +409,31 @@ class TestCompactReviewSession:
 
     def test_process_that_ignores_sigterm_is_killed(self, srv, tmp_path, monkeypatch):
         seen = self._run(srv, tmp_path, monkeypatch, subprocess.TimeoutExpired("claude", 180), hang_after_kill=True)
-        assert seen["second_timeout"] == 10
+        assert seen["second_timeout"] == 5
         assert seen["killed"] == [(4242, srv.signal.SIGTERM), (4242, srv.signal.SIGKILL)]
+
+    def test_string_timeout_in_config_is_coerced(self, srv, tmp_path, monkeypatch):
+        srv.CONFIG["compact_timeout_sec"] = "90"
+        assert self._run(srv, tmp_path, monkeypatch, json.dumps({"session_id": "c"}))["timeout"] == 90
+
+    def test_clearing_that_starts_during_launch_stops_the_process(self, srv, tmp_path, monkeypatch):
+        real_popen_seen = {}
+        stopped = []
+        monkeypatch.setattr(srv, "stop_process", lambda proc: stopped.append(proc))
+
+        class Proc:
+            pid = 1
+
+            def __init__(self, cmd, **kw):
+                srv.CLEARING.set()
+                real_popen_seen["started"] = True
+
+            def communicate(self, *a, **kw):
+                raise AssertionError("must not run")
+        monkeypatch.setattr(srv.subprocess, "Popen", Proc)
+        srv.compact_review_session(KEY, "r1", tmp_path, "review-1", tmp_path)
+        assert real_popen_seen and len(stopped) == 1 and not (tmp_path / "session.json").exists()
+        assert (KEY, "r1") not in srv.COMPACT_PROCS
 
     def test_skipped_while_clearing(self, srv, tmp_path, monkeypatch):
         srv.CLEARING.set()
@@ -596,3 +619,95 @@ class TestAllProcs:
         finally:
             srv.RUNNING_PROCS.clear()
             srv.COMPACT_PROCS.clear()
+
+
+class TestStopProcess:
+    """Stopping a process group: SIGTERM, then SIGKILL if it lingers, always reaped, never raising."""
+
+    @pytest.fixture
+    def kills(self, srv, monkeypatch):
+        sent = []
+
+        def killpg(pid, sig):
+            sent.append(sig)
+            if pid == 0:
+                raise ProcessLookupError
+        monkeypatch.setattr(srv.os, "killpg", killpg)
+        return sent
+
+    def _proc(self, pid, timeouts):
+        reaped = []
+
+        def communicate(timeout=None):
+            reaped.append(timeout)
+            if len(reaped) <= timeouts:
+                raise subprocess.TimeoutExpired("claude", timeout)
+            return "", ""
+        return SimpleNamespace(pid=pid, communicate=communicate), reaped
+
+    @pytest.mark.parametrize("timeouts, signals, waits", [
+        (0, ["TERM"], [10]),
+        (1, ["TERM", "KILL"], [10, 5]),
+        (2, ["TERM", "KILL"], [10, 5]),
+    ])
+    def test_escalates_and_reaps(self, srv, kills, timeouts, signals, waits):
+        proc, reaped = self._proc(42, timeouts)
+        srv.stop_process(proc)
+        assert kills == [getattr(srv.signal, f"SIG{s}") for s in signals] and reaped == waits
+
+    def test_already_gone_is_fine(self, srv, kills):
+        proc, reaped = self._proc(0, 0)
+        srv.stop_process(proc)
+        assert reaped == [10]
+
+
+class TestStartCompactionRegistersFirst:
+    def test_busy_is_registered_before_the_thread_runs(self, srv, tmp_path, monkeypatch):
+        started = []
+        monkeypatch.setattr(srv.threading, "Thread", lambda target, **kw: SimpleNamespace(
+            start=lambda: started.append(set(srv.BUSY))))
+        srv.start_compaction(KEY, "r1", tmp_path, "review-1", tmp_path)
+        assert started == [{f"compact:{KEY}:r1"}] and (KEY, "r1") in srv.COMPACTING
+        srv.BUSY.clear()
+        srv.COMPACTING.clear()
+
+    def test_skipped_when_clearing(self, srv, tmp_path, monkeypatch):
+        monkeypatch.setattr(srv.threading, "Thread", lambda **kw: pytest.fail("no thread while clearing"))
+        srv.CLEARING.set()
+        srv.start_compaction(KEY, "r1", tmp_path, "review-1", tmp_path)
+        assert srv.BUSY == set() and (KEY, "r1") not in srv.COMPACTING
+
+    def test_chat_waits_only_a_bounded_time(self, srv, monkeypatch):
+        waited = []
+        srv.COMPACTING[(KEY, "r1")] = SimpleNamespace(wait=lambda t: waited.append(t))
+        try:
+            srv.wait_for_compaction(KEY, "r1")
+        finally:
+            srv.COMPACTING.clear()
+        assert waited == [srv.COMPACTION_WAIT_SEC] and srv.COMPACTION_WAIT_SEC <= 60
+
+
+class TestChatFailures:
+    """Any failed fork falls back to a fresh chat; a failing chat session is dropped for the next message."""
+
+    @pytest.fixture
+    def chat(self, srv, monkeypatch):
+        _pr(srv, title="t", url="u", head_ref="feat", base_ref="main")
+        run_dir = srv.REPORTS / KEY / "20260101-120000"
+        run_dir.mkdir(parents=True)
+        (srv.PRS_DIR / KEY).mkdir(parents=True)
+        (run_dir / "findings.json").write_text(json.dumps({"findings": [], "meta": {"head_sha": "a" * 40}}))
+        monkeypatch.setattr(srv, "build_chat_prompt", lambda *a: "discuss")
+        return run_dir
+
+    def test_any_fork_error_falls_back(self, srv, tmp_path, monkeypatch):
+        monkeypatch.setattr(srv.subprocess, "run", lambda cmd, **kw: SimpleNamespace(
+            stdout=json.dumps({"is_error": True, "result": "something odd"}), stderr="", returncode=1))
+        assert srv.run_chat_claude(tmp_path, "hi", "compact-1", fork=True) is None
+
+    def test_failing_chat_session_is_dropped(self, srv, chat, monkeypatch):
+        srv.save_chat(KEY, {"sessions": {"20260101-120000": "chat-1"}, "messages": []})
+        monkeypatch.setattr(srv, "run_chat_claude", lambda *a, **kw: (_ for _ in ()).throw(RuntimeError("boom")))
+        with pytest.raises(RuntimeError, match="boom"):
+            srv.chat_turn(KEY, "20260101-120000", "why F1?")
+        assert srv.load_chat(KEY)["sessions"] == {}

@@ -77,12 +77,23 @@ class TestParseOutput:
         text = "<<<REPORT\nmy report\nREPORT>>>\n" + self.BLOCK.format(body=json.dumps(FINDINGS))
         assert srv.parse_output(text)[0] == "my report"
 
-    @pytest.mark.parametrize("bad", [{"ticket": "ABC-1"}, {"flow_context": ["x"]}, {"findings": ["F1"]},
-                                     {"previously_raised": "none"}, {"kb_regression": "skipped"}])
-    def test_odd_field_types_keep_the_raw_text(self, srv, bad):
-        text = self.BLOCK.format(body=json.dumps(bad))
-        report, findings = srv.parse_output(text)
-        assert findings == bad and report == text.strip()
+    @pytest.mark.parametrize("bad, kept", [
+        ({"ticket": "ABC-1"}, "Ticket: none linked"),
+        ({"flow_context": ["x"]}, "MUST FIX"),
+        ({"findings": ["F1", {"id": "F2", "severity": "low", "title": "ok"}]}, "[LOW] F2 ok"),
+        ({"previously_raised": "none"}, "MUST FIX"),
+        ({"kb_regression": "skipped", "must_fix": [7, {"severity": "high", "title": "t"}]}, "1. [HIGH] t"),
+        ({"top_priorities": "cap", "not_validated": 3, "kb_regression": {"ran": True, "checked": "x"}},
+         "KNOWLEDGE-BASE REGRESSION"),
+    ])
+    def test_odd_fields_are_skipped_not_the_report(self, srv, bad, kept):
+        report, findings = srv.parse_output(self.BLOCK.format(body=json.dumps(bad)))
+        assert findings == bad and kept in report and "FINDINGS_JSON" not in report
+
+    def test_render_failure_keeps_the_raw_text(self, srv, monkeypatch):
+        monkeypatch.setattr(srv, "render_report", lambda f: 1 / 0)
+        text = self.BLOCK.format(body="{}")
+        assert srv.parse_output(text)[0] == text.strip()
 
     @pytest.mark.parametrize("text", ["just prose", BLOCK.format(body="{not json"), BLOCK.format(body="[1, 2]")])
     def test_unparseable_output_keeps_the_raw_text(self, srv, text):
