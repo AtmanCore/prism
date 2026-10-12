@@ -1,4 +1,6 @@
 .env
+.env.*
+!.env.example
 config.json
 config.local.json
 data/
@@ -21,3 +23,6 @@ requirements-dev.txt
 .ruff_cache/
 ruff.toml
 .pytest_cache/
+.idea/
+htmlcov/
+coverage.xml

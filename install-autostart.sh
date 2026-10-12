@@ -2,12 +2,17 @@
 # Install a launchd LaunchAgent: start the service at login and restart it if it crashes.
 set -euo pipefail
 cd "$(dirname "$0")"
+if [[ "$(uname)" != Darwin ]]; then
+  echo "Auto-start uses launchd (macOS only). On Linux, run ./start.sh or a systemd user unit (see README)." >&2
+  exit 1
+fi
 DIR=$(pwd)
 LABEL=local.pr-review
 PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
 PY=$(python3 -c 'import sys; print(sys.executable)')
-# launchd starts with a bare PATH; give it everything the reviews shell out to.
-PATH_VAL="$HOME/.local/bin:/opt/homebrew/bin:/opt/homebrew/sbin:$HOME/.pyenv/shims:$(dirname "$(command -v node 2>/dev/null || echo /usr/bin/node)"):/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+# launchd starts with a bare PATH; give it everything the reviews shell out to, wherever it lives.
+TOOL_DIRS=$(for t in claude gh git node; do p=$(command -v "$t" 2>/dev/null) && dirname "$p"; done | awk '!seen[$0]++' | paste -sd: -)
+PATH_VAL="${TOOL_DIRS:+$TOOL_DIRS:}$HOME/.local/bin:/opt/homebrew/bin:/opt/homebrew/sbin:$HOME/.pyenv/shims:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 
 # Drain and stop a copy started by hand (nohup) so the two don't fight over the port.
 if [[ -f service.pid ]] && kill -0 "$(cat service.pid)" 2>/dev/null && ! launchctl print "gui/$(id -u)/$LABEL" >/dev/null 2>&1; then

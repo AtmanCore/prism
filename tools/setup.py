@@ -187,7 +187,7 @@ def write_env(updates: dict[str, str]) -> None:
             lines[i] = f"{key}={updates[key]}"
             done.add(key)
     lines += [f"{k}={v}" for k, v in updates.items() if k not in done]
-    fd, tmp = tempfile.mkstemp(dir=ROOT, prefix=".env.")
+    fd, tmp = tempfile.mkstemp(dir=ROOT, prefix=".env.", suffix=".tmp")
     with os.fdopen(fd, "w") as f:
         f.write("\n".join(lines) + "\n")
     os.chmod(tmp, 0o600)

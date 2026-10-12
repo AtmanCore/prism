@@ -34,6 +34,7 @@ Medium and Low findings only count when they're on lines the PR changes, and Med
 - [Running it: start, stop, auto-start](#running-it)
 - [Safety](#safety)
 - [Troubleshooting](#troubleshooting)
+- [Development](#development)
 - [Layout](#layout)
 - [License](#license)
 
@@ -43,7 +44,7 @@ Medium and Low findings only count when they're on lines the PR changes, and Med
 
 | What | Why | Check |
 | --- | --- | --- |
-| macOS or Linux (native), or any OS with Docker | Auto-start uses launchd (macOS); with Docker, compose restarts it. On Linux, run `./start.sh` or write a systemd unit that runs `run.sh`. Windows isn't supported directly; use WSL. | |
+| macOS or Linux (native), or any OS with Docker | Auto-start uses launchd (macOS); with Docker, compose restarts it. On Linux, run `./start.sh` or use a systemd unit (see [Auto-start on Linux](#auto-start-on-linux-systemd)). Windows isn't supported directly; use WSL. | |
 | **Python 3.9+** (macOS's built-in `python3` works) | The service. It uses only the standard library; there's nothing to `pip install`. | `python3 --version` |
 | **git** | Partial clones and worktrees. | `git --version` |
 | **GitHub CLI (`gh`)**, logged in | Finds PRs, reads diffs and threads, and posts only when you confirm. | `gh auth status` |
@@ -100,6 +101,7 @@ All keys live in **one file, `.env`**. Every value in it is passed to the `gh`, 
 | `JIRA_URL`, `JIRA_USERNAME`, `JIRA_API_TOKEN`, `CONFLUENCE_URL`, `CONFLUENCE_USERNAME`, `CONFLUENCE_API_TOKEN` | Docker only, optional | The bundled read-only Atlassian server. Natively, use your own MCP setup instead. See [docs/setup.md](docs/setup.md#4-jira-and-confluence-optional-an-atlassian-api-token). | An Atlassian API token (reads what you can read). |
 | `ANTHROPIC_API_KEY` | No. Empty means your logged-in Claude Code account (subscription) is used. Set it only if you want per-token API billing. | The `claude -p` reviews and chats. | |
 | `PR_REVIEW_PORT` | No | Port override (default `6161`). | |
+| `PRISM_BIND`, `PRISM_EXTRA_READ_TOOLS`, `PR_REVIEW_PYTHON` | No, set for you | Internal: the listen address (the Docker image sets `0.0.0.0`), ticket tools the Docker entrypoint registers, and the Python that `run.sh` and launchd use. Leave them unset. | |
 
 Cloning uses `github.clone_url` (default `git@github.com:{repo}.git`, i.e. SSH). For HTTPS with a token, set it to `https://github.com/{repo}.git` and make sure `gh auth setup-git` has run.
 
@@ -119,7 +121,8 @@ Claude Code needs to be logged in as the same OS user the service runs as, becau
     "orgs": ["my-org"],                        // adds org:my-org (several are OR'd); [] = all
     "include_my_reviews": true,                // also keep open PRs you reviewed/commented on
     "my_reviews_window_days": 30,              // ...if updated within this many days
-    "clone_url": "git@github.com:{repo}.git"
+    "clone_url": "git@github.com:{repo}.git",
+    "auto_review_forks": false                 // fork PRs run a stranger's code: review them only on request
   },
   "poll_interval_sec": 300,                    // or pick "Every N min" next to Sync now
   "auto_review": true,                         // review PRs you're asked to review automatically (switch in "To review")
@@ -128,7 +131,7 @@ Claude Code needs to be logged in as the same OS user the service runs as, becau
   "max_concurrent_reviews": 3,
   "review_timeout_sec": 2700,
   "response_check_timeout_sec": 900,           // one check of replies to your comments
-  "claude": { "bin": "claude", "model": null, "draft_model": "sonnet", "chat_model": null },
+  "claude": { "bin": "claude", "model": null, "draft_model": "sonnet", "chat_model": null }, // null = your Claude Code default model
   "chat_timeout_sec": 600,                     // one "Ask the agent" reply
   "compact_after_review": true,                // keep a compacted copy of each review's session for "Ask the agent"
   "compact_timeout_sec": 180,                  // one compaction; runs in the background after the review
@@ -268,7 +271,7 @@ Tools in neither list can't be used anyway, because headless runs deny anything 
 | `reviewer.mode` | Uses | Lessons files | Good for |
 | --- | --- | --- | --- |
 | `bundled` (default) | `prompts/review_bundled.md` plus the two agents in `reviewers/`: `prr-code-reviewer` and `prr-consistency-reviewer` | `data/lessons/*.lessons.md` | Anyone cloning this repo; nothing else to install. |
-| `user` | Your own Claude Code skill at `reviewer.skill_path`, and whatever agents it calls from `~/.claude/agents/` | Set `reviewer.lessons_files` to your agents' lessons files | People with an existing `/pr-review` skill. `prompts/review_user.md` tells the skill which of its phases to skip (fetch, ticket, threads, checkout, posting) and assumes a code-review agent and a consistency-review agent; adapt it to your skill's steps. |
+| `user` | Your own Claude Code skill at `reviewer.skill_path`, and whatever agents it calls from `~/.claude/agents/` | Set `reviewer.lessons_files` to your agents' lessons files | People with an existing `/pr-review` skill. `prompts/review_user.md` tells the skill which steps to skip (threads, checkout, posting) and assumes a code-review agent and a consistency-review agent; adapt it to your skill's steps. |
 
 Both modes share the same output format (`prompts/_output.md`), so the UI works with either. To change how reviews behave, edit `reviewers/*.md` (bundled) or your skill (user).
 
@@ -378,17 +381,36 @@ tail -f service.log
 
 - It starts at login and restarts on crash (`KeepAlive`).
 - Once it's installed, the scripts above go through launchd. `./stop.sh` unloads the service until the next `./start.sh` or login. `kill` alone won't stop it, because launchd restarts it.
-- launchd starts with a bare `PATH`, so the plist has one fixed `PATH` built from where `gh`, `claude`, `node` and your Python lived at install time. **Re-run `./install-autostart.sh`** after moving this folder or changing those tools (e.g. a new nvm Node version).
+- launchd starts with a bare `PATH`, so the plist has one fixed `PATH` built from where `claude`, `gh`, `git`, `node` and your Python lived at install time. **Re-run `./install-autostart.sh`** after moving this folder or changing those tools (e.g. a new nvm Node version).
 - Check it with `launchctl print gui/$(id -u)/local.pr-review | grep -E "state|pid"`.
+
+### Auto-start on Linux (systemd)
+
+Save this as `~/.config/systemd/user/prism.service`, with `WorkingDirectory` and `ExecStart` pointing at your checkout:
+
+```ini
+[Unit]
+Description=PRism PR review service
+
+[Service]
+WorkingDirectory=%h/prism
+ExecStart=%h/prism/run.sh
+Restart=on-failure
+
+[Install]
+WantedBy=default.target
+```
+
+Then `systemctl --user daemon-reload && systemctl --user enable --now prism`, and `loginctl enable-linger $USER` if it should run while you're logged out. The service sees systemd's `PATH`, so add `Environment=PATH=...` if `claude` or `gh` live somewhere else (e.g. `~/.local/bin`).
 
 ---
 
 ## Safety
 
-- **Background reviews are blocked from writing.** `claude -p` runs with an allow-list (`Bash`, `Read`, `Grep`, `Glob`, `Agent`, plus your `tickets.read_tools`) and a deny-list: `gh pr comment/review/edit/merge/close/create`, `gh api`, `gh issue` writes, `gh alias`, `bash -c`, `gh auth token`, `git push`, `curl`, `wget`, `kubectl`, `docker`, `gcloud`, `aws`, file edits, and your `tickets.deny_tools`. The deny-list matches command prefixes, so it's a strong guard rail rather than a sandbox. **What the token itself allows still matters.** The default fine-grained token has no *Contents: write*, so it can't push code or merge, whatever command runs. It does have *Pull requests: write* (so the Post button works), and reviews hold it too: a review that slips past the deny-list (for example with a `python3 -c` script), or the PR's own lint code (see Trust boundary), could comment on, approve, close or edit PRs. **In Docker**, a *Pull requests: Read* token (if you never post or approve from PRism) means reviews can't write to GitHub at all. **Natively**, reviews also run as you, with your `gh` keyring login and SSH keys, so the deny-list is the only guard; use Docker if that matters.
+- **Background reviews are blocked from writing.** `claude -p` runs with an allow-list (`Bash`, `Read`, `Grep`, `Glob`, `Agent`, plus your `tickets.read_tools`) and a deny-list: `gh pr comment/review/edit/merge/close/create`, `gh api`, `gh issue` writes, `gh repo`, `gh project`, `gh alias`, `gh auth`, `bash -c`, `git push` (and `git -C …`/`git -c …`), `curl`, `wget`, `kubectl`, `docker`, `gcloud`, `aws`, file edits, and your `tickets.deny_tools`. The deny-list matches command prefixes, so it's a strong guard rail rather than a sandbox. **What the token itself allows still matters.** The default fine-grained token has no *Contents: write*, so it can't push code or merge, whatever command runs. It does have *Pull requests: write* (so the Post button works), and reviews hold it too: a review that slips past the deny-list (for example with a `python3 -c` script), or the PR's own lint code (see Trust boundary), could comment on, approve, close or edit PRs. **In Docker**, a *Pull requests: Read* token (if you never post or approve from PRism) means reviews can't write to GitHub at all. **Natively**, reviews also run as you, with your `gh` keyring login and SSH keys, so the deny-list is the only guard; use Docker if that matters.
 - **Posting and approving need your typed confirmation** (`comment` / `approve`) in the UI and an explicit flag on the server. Nothing else writes to GitHub (the Approve permission check is a no-op request, see Approving).
-- **Reviewed repos can't configure Claude.** Reviews use `--setting-sources user`, so a PR's own `.claude/settings.json` (hooks, permissions), `.mcp.json` and `CLAUDE.md` are ignored.
-- **Trust boundary:** the code pass runs the repo's own lint tooling (`make lint`, `npm run lint`, …) in the worktree, and that executes code from the PR. Use this on repos whose contributors you trust (your org's PRs), not on arbitrary forks.
+- **Reviewed repos can't configure Claude.** Reviews use `--setting-sources user`, so a PR's own `.claude/settings.json` (hooks, permissions), `.mcp.json` and `CLAUDE.md` are ignored. Your own `~/.claude` settings, hooks and `CLAUDE.md` still apply to reviews.
+- **Trust boundary:** the code pass runs the repo's own lint tooling (`make lint`, `npm run lint`, …) in the worktree, and that executes code from the PR. Anything the PR runs can read every token in `.env` (GitHub, Claude, Atlassian). Use this on repos whose contributors you trust (your org's PRs). PRs from forks are listed but only reviewed when you click **Review** (`github.auto_review_forks` changes that).
 - **Local only:** the server binds to `127.0.0.1`, answers only requests addressed to `localhost`/`127.0.0.1` (which blocks DNS-rebinding pages), and POST endpoints reject cross-site requests. The knowledge-base folder picker can only see inside your home folder.
 - **Reviews only read knowledge bases.** Secrets are never resolved and no service is started. The exceptions are ones you set up: a KB's `refresh_command` runs before reviews, and **Refresh now** on a skill-built KB lets Claude write inside that KB only (no shell, no MCP servers, no network tools).
 
@@ -426,7 +448,7 @@ python3 -m venv .venv && .venv/bin/pip install -r requirements-dev.txt
 
 ## Layout
 
-Internal names still say `pr-review` in a few places (the default folder name, the launchd label `local.pr-review`, the `PR_REVIEW_PORT` and `PR_REVIEW_PYTHON` variables). They're harmless identifiers, kept so existing installs keep working.
+Internal names still say `pr-review` in a few places (the default folder name, the launchd label `local.pr-review`, the `PR_REVIEW_PORT` and `PR_REVIEW_PYTHON` variables). They're internal identifiers and harmless.
 
 ```
 server.py                  poller, review queue, reply checks, lessons, HTTP API, static server

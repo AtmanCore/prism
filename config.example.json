@@ -5,7 +5,8 @@
     "orgs": [],
     "include_my_reviews": true,
     "my_reviews_window_days": 30,
-    "clone_url": "git@github.com:{repo}.git"
+    "clone_url": "git@github.com:{repo}.git",
+    "auto_review_forks": false
   },
   "poll_interval_sec": 300,
   "auto_review": true,

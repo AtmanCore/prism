@@ -95,7 +95,19 @@ READ_ONLY_DENY = [
     "Bash(docker:*)",
     "Bash(gcloud:*)",
     "Bash(aws:*)",
-    "Bash(gh auth token:*)",
+    "Bash(gh auth:*)",
+    "Bash(gh project:*)",
+    "Bash(gh run cancel:*)",
+    "Bash(gh run delete:*)",
+    "Bash(gh cache:*)",
+    "Bash(gh issue develop:*)",
+    "Bash(gh issue pin:*)",
+    "Bash(gh issue unpin:*)",
+    "Bash(gh ssh-key:*)",
+    "Bash(gh gpg-key:*)",
+    "Bash(gh codespace:*)",
+    "Bash(git -C:*)",
+    "Bash(git -c:*)",
     "Bash(curl:*)",
     "Bash(wget:*)",
 ]
@@ -168,7 +180,7 @@ query($q: String!) {
     issueCount
     nodes {
       ... on PullRequest {
-        number title url isDraft createdAt updatedAt
+        number title url isDraft isCrossRepository createdAt updatedAt
         additions deletions changedFiles
         headRefName baseRefName headRefOid reviewDecision
         author { login avatarUrl }
@@ -201,7 +213,10 @@ DEFAULTS: dict = {
     "port": 6161,
     "github": {"search_query": "is:pr is:open draft:false review-requested:@me", "orgs": [],
                "include_my_reviews": True, "my_reviews_window_days": 30,
-               "clone_url": "git@github.com:{repo}.git"},
+               "clone_url": "git@github.com:{repo}.git",
+               # A review runs the PR's code (its lint) with your tokens, so PRs from forks are only
+               # reviewed when you click Review, unless this is on.
+               "auto_review_forks": False},
     "poll_interval_sec": 300,
     "auto_review": True,
     "auto_rereview_on_new_commits": True,
@@ -950,6 +965,7 @@ def poll_once() -> None:
                 "requested": requested,
                 "authored": authored,
                 "draft": bool(n.get("isDraft")),
+                "fork": bool(n.get("isCrossRepository")),
                 "closed_state": None,
                 **my_review_state(n, viewer, requested),
             }
@@ -970,6 +986,8 @@ def poll_once() -> None:
             # Auto-review what needs your attention; PRs you already reviewed only re-run on changes.
             # Your own PRs (My PRs) only when you ask, unless "Auto-review my PRs" is on.
             auto = my_prs_auto() if authored else CONFIG.get("auto_review", True)
+            if merged["fork"] and not authored and not CONFIG["github"].get("auto_review_forks", False):
+                auto = False  # a stranger's fork: its code would run with your tokens
             wants_review = authored or requested or merged["my_state"] == "updated"
             if status in ("queued", "preparing", "kb-refresh", "reviewing"):
                 continue
@@ -1598,7 +1616,7 @@ RESP_JOBS: "queue.Queue[tuple[str, bool]]" = queue.Queue()
 RESP_QUEUED: set[str] = set()
 LESSON_LOCK = threading.Lock()
 CANDIDATES_FILE = DATA / "lesson_candidates.json"
-LESSON_ALIASES = {"dev-reviewer": "code", "pr-reviewer": "consistency"}  # agent names used by older user-mode setups
+LESSON_ALIASES = {"dev-reviewer": "code", "pr-reviewer": "consistency"}  # common agent names in user mode
 
 
 LESSON_CAP = 30
@@ -3232,16 +3250,21 @@ def main() -> None:
     if unlisted_user_mcp_tools():
         log.info("Blocked in reviews (pre-approved in ~/.claude/settings.json but not in tickets.read_tools): %s",
                  ", ".join(unlisted_user_mcp_tools()))
+    port = int(DOTENV.get("PR_REVIEW_PORT") or os.environ.get("PR_REVIEW_PORT") or CONFIG.get("port", 6161))
+    # 127.0.0.1 natively. The Docker image sets PRISM_BIND=0.0.0.0 so the published port works; compose
+    # publishes it on the host's 127.0.0.1 only, and the Host check still refuses other host names.
+    bind = os.environ.get("PRISM_BIND") or "127.0.0.1"
+    try:  # before any worker starts, so a busy port doesn't leave reviews running headless
+        httpd = ThreadingHTTPServer((bind, port), Handler)
+    except OSError as e:
+        log.error("Can't listen on port %d (%s). Set PR_REVIEW_PORT in .env, or find the other process "
+                  "with `lsof -i :%d`.", port, e.strerror or e, port)
+        sys.exit(1)
     for _ in range(max(1, int(CONFIG.get("max_concurrent_reviews", 2)))):
         threading.Thread(target=worker_loop, daemon=True).start()
     threading.Thread(target=poller_loop, daemon=True).start()
     threading.Thread(target=cleanup_inactive, daemon=True).start()
     threading.Thread(target=response_worker, daemon=True).start()
-    port = int(DOTENV.get("PR_REVIEW_PORT") or os.environ.get("PR_REVIEW_PORT") or CONFIG.get("port", 6161))
-    # 127.0.0.1 natively. The Docker image sets PRISM_BIND=0.0.0.0 so the published port works; compose
-    # publishes it on the host's 127.0.0.1 only, and the Host check still refuses other host names.
-    bind = os.environ.get("PRISM_BIND") or "127.0.0.1"
-    httpd = ThreadingHTTPServer((bind, port), Handler)
     log.info("PRism service on http://localhost:%d", port)
     try:
         httpd.serve_forever()

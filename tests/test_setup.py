@@ -56,6 +56,13 @@ class TestEnvFile:
                                         "CLAUDE_CODE_OAUTH_TOKEN": TOKEN}
         assert [p.name for p in setup_mod.ROOT.iterdir()] == [".env"]
 
+    def test_temp_file_is_gitignored_while_it_exists(self, setup_mod, monkeypatch):
+        made = []
+        real = setup_mod.tempfile.mkstemp
+        monkeypatch.setattr(setup_mod.tempfile, "mkstemp", lambda **kw: made.append(real(**kw)) or made[-1])
+        setup_mod.write_env({"GITHUB_TOKEN": "ghp_x"})
+        assert made[0][1].endswith(".tmp")
+
 
 class TestGithubTokenPage:
     """The pre-filled fine-grained token page."""
