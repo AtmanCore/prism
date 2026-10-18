@@ -5,7 +5,7 @@ running it.
 
 | Pillar | Used for | Required? | Access it needs |
 | --- | --- | --- | --- |
-| **GitHub** | Finding PRs that request your review, reading diffs and review threads, cloning | Yes | Read code; read and write pull requests (to post comments and approve PRs when you confirm) |
+| **GitHub** | Finding PRs that request your review, reading diffs and review threads, cloning | Yes | Classic token: `repo`, `read:org`, authorized for your org's SAML SSO if it uses it (lets PRism post comments and approve PRs when you confirm) |
 | **Claude** | Running the reviews and the "Ask the agent" chat | Yes | Your Claude subscription (or an API key) |
 | **Jira** | Reading the ticket a PR links to, so the review checks the acceptance criteria | Optional | Read |
 | **Confluence** | Reading design docs a PR links to | Optional | Read |
@@ -49,16 +49,18 @@ docker compose up -d --build
 ```
 
 The helper does steps 1–4 below with you. For each service it opens the right page in your browser
-(GitHub's is pre-filled with the name, your org, 90-day expiry and only the permissions PRism needs), you click
+(GitHub's is a classic token page with the `repo` and `read:org` scopes filled in), you click
 **Generate** or **Approve**, paste once into a hidden prompt, and it tests the token before saving it
 to `.env`. For Claude it runs `claude setup-token` and picks the token up by itself. Tokens are never
 printed. Run `./setup.sh --check` any time to re-test what's saved, or `./setup.sh github`,
 `./setup.sh claude`, `./setup.sh atlassian` or `./setup.sh kb` (mount knowledge-base folders) to redo one part.
 
+If your org uses SAML SSO, authorize the new token for it (see [step 2](#2-github-one-token)), or
+your org's PRs won't show up.
+
 **Why tokens, not your existing logins?** On macOS, `gh` and Claude Code keep their logins in the
-Keychain, so there's nothing a container could mount. And your `gh` login can usually do anything you can, including push
-and merge, while PRism's token can't. `./setup.sh` can reuse your `gh` login if you choose to, with
-a warning.
+Keychain, so there's nothing a container could mount. `./setup.sh` can reuse your `gh` login token if
+you choose to, though it usually has more scopes than PRism needs.
 
 The manual steps, if you'd rather do it by hand:
 
@@ -77,28 +79,26 @@ folder with that name instead, and PRism will tell you to fix it.
 
 The container can't use your host's `gh` login, so it uses a token.
 
-1. Go to GitHub → **Settings → Developer settings → Fine-grained personal access tokens → Generate
-   new token**.
-2. **Resource owner:** your organization. **Repository access:** all repositories, or the ones you
-   review.
-3. **Permissions → Repository:** *Contents: Read*, *Metadata: Read*, *Issues: Read*, and *Pull requests:
-   Read and write* (just *Read* if you won't post comments or approve PRs from PRism).
-4. Put it in `.env`:
+1. Create a **classic** personal access token at <https://github.com/settings/tokens/new> with the
+   scopes **`repo`** and **`read:org`**. This lets PRism read PRs, and post comments and approve PRs
+   when you confirm it in the UI.
+2. **If your organization uses SAML SSO:** on the [tokens list](https://github.com/settings/tokens),
+   click **Configure SSO** next to the token and **Authorize** it for your org. Otherwise your org's
+   PRs won't show up.
+3. Put it in `.env`, or paste it when `./setup.sh` asks:
    ```
-   GITHUB_TOKEN=github_pat_...
+   GITHUB_TOKEN=ghp_...
    ```
 
-Without *Contents: write*, this token can't push code or merge, whatever command runs. Its *Pull
-requests: write* lets the **Post** button work. Reviews hold the same token, and PRism's command
-deny-list blocks the `gh` commands that comment, approve or edit. That list is a guard rail, not a
-sandbox: a review that slips past it, or a PR's own lint code, could comment on, approve, close or
-edit PRs.
+A classic `repo` token can also push and merge. PRism's command deny-list blocks that, but it's a
+guard rail, not a sandbox. See [Safety](safety.md).
 
-If you never post from the UI, give it *Pull requests: Read* only (answer "no" in `./setup.sh`):
-then reviews can't write to GitHub at all.
-
-Your organization may need to approve fine-grained tokens. If PRs don't show up, check the token's
-status on that settings page.
+**Stricter alternative: a fine-grained token.** Under **Developer settings → Fine-grained personal
+access tokens**, pick your organization as the resource owner and give it *Contents: Read*,
+*Metadata: Read*, *Issues: Read* and *Pull requests: Read and write* (just *Read* if you won't post or
+approve from PRism; then reviews can't write to GitHub at all). Without *Contents: write* it can't
+push or merge. Your organization may need to approve fine-grained tokens; if PRs don't show up,
+check the token's status on that settings page.
 
 ### 3. Claude: your subscription, via a token
 
@@ -198,7 +198,11 @@ re-created on the next start.
 ## Native (macOS or Linux)
 
 You need Python 3.9+ (macOS's built-in `python3` works), git, the
-[GitHub CLI](https://cli.github.com) and [Claude Code](https://claude.com/claude-code).
+[GitHub CLI](https://cli.github.com) and [Claude Code](https://claude.com/claude-code). On Windows, use WSL.
+
+Repos are cloned over SSH by default, so check `ssh -T git@github.com` works. Without an SSH key, set
+`github.clone_url` to `https://github.com/{repo}.git` in `config.json` and run `gh auth setup-git`
+(see [configuration.md](configuration.md)).
 
 ### 1. Get the files
 
@@ -210,16 +214,24 @@ cp .env.example .env              # can stay empty natively
 
 ### 2. GitHub
 
+Either log in with the GitHub CLI:
+
 ```sh
 gh auth login
 gh auth status
 ```
 
-PRism uses this login. Your `gh` login usually has the `repo` scope, which can push and merge, and
-only PRism's command deny-list stands in the way. To narrow that, put a fine-grained `GITHUB_TOKEN`
-in `.env` (step 2 of the Docker setup, or `./setup.sh github`). Natively, reviews still run as you (your `gh`
-keyring login and SSH keys stay reachable), so the deny-list is the real guard; for reviews that
-truly can't write, run PRism in Docker with a read-only token (then **Post** and **Approve** are unavailable).
+Or put a classic token in `.env` as `GITHUB_TOKEN=ghp_...`, created as in
+[step 2 of the Docker setup](#2-github-one-token) (`./setup.sh github` helps).
+
+Either way, **if your organization uses SAML SSO, authorize it for your org**: for a token, click
+**Configure SSO** next to it on <https://github.com/settings/tokens>; for `gh auth login`, authorize
+your org when the browser login asks. Otherwise your org's PRs won't show up.
+
+Both can push and merge; only PRism's command deny-list stands in the way. Natively, reviews also run
+as you (your `gh` keyring login and SSH keys stay reachable), so the deny-list is the real guard. For
+reviews that truly can't write, run PRism in Docker with a read-only fine-grained token (then
+**Post** and **Approve** are unavailable). See [Safety](safety.md).
 
 ### 3. Claude
 
@@ -261,8 +273,8 @@ pre-approves other MCP tools, PRism blocks them in reviews; the startup log list
 One exception: if your settings allow a **whole server** (e.g. `"mcp__atlassian"`) and you list some
 of its tools in `read_tools`, PRism can't block the rest without blocking those too. List that
 server's write tools in `deny_tools` (the startup log warns when this applies).
-With `read_tools` empty, reviews don't touch Jira or Confluence at all. The README section
-[Tickets and docs through MCP](../README.md#tickets-and-docs-through-mcp) has more examples.
+With `read_tools` empty, reviews don't touch Jira or Confluence at all. [Tickets and docs through MCP](configuration.md#tickets-and-docs-through-mcp)
+has more examples.
 
 ### 5. Start it
 
@@ -286,4 +298,4 @@ In the UI, open any PR and click **Review again**, then look at:
 | Jira | The review's **Acceptance criteria** tab lists the ticket's criteria; the Details panel shows the ticket |
 | Confluence | Linked docs appear in the review's sources; anything unreadable is listed under "not validated" |
 
-If something fails, see [Troubleshooting](../README.md#troubleshooting).
+If something fails, see [Troubleshooting](troubleshooting.md).
