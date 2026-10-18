@@ -3,7 +3,7 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 if [[ "$(uname)" != Darwin ]]; then
-  echo "Auto-start uses launchd (macOS only). On Linux, run ./start.sh or a systemd user unit (see README)." >&2
+  echo "Auto-start uses launchd (macOS only). On Linux, run ./start.sh or a systemd user unit (see docs/usage.md)." >&2
   exit 1
 fi
 DIR=$(pwd)

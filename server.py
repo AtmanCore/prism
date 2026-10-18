@@ -159,7 +159,7 @@ def unlisted_user_mcp_tools() -> list[str]:
             if rule not in _WARNED_SERVER_RULES:
                 _WARNED_SERVER_RULES.add(rule)
                 log.warning("~/.claude/settings.json allows the whole MCP server %r, so reviews can call all "
-                            "of its tools. List its write tools in tickets.deny_tools (see README).", rule)
+                            "of its tools. List its write tools in tickets.deny_tools (docs/configuration.md).", rule)
             continue
         out.append(rule)
     return out

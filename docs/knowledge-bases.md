@@ -2,7 +2,14 @@
 
 A knowledge base (KB) gives reviews what the diff can't: who calls this code, what it writes to, and which contracts other services depend on. With it, a review can say *"this renames `status` in `order.created`, which billing-worker and analytics consume"* instead of only commenting on the lines in front of it.
 
-A KB is **just a folder of markdown** on your machine. PRism only **reads** it: it never runs anything from it, and never resolves secrets.
+A KB is **just a folder of markdown** on your machine: service overviews, APIs, data models, deployments, architecture notes. Generated docs, hand-written docs and a docs repo checkout all work. When a PR's repo is attached to a KB, the review only **reads** it to:
+
+- write the **flow context**: who calls this code, what it calls or writes downstream, and which part the PR changes;
+- catch **regressions the diff alone can't show**: broken API/data contracts with documented consumers, env vars a deployment still sets, and documented behavior the change silently alters.
+
+PRism never resolves secrets from a KB, and never runs anything from it unless you set a `refresh_command`. If you do, PRism **runs that command** in the KB folder before reviews and on **Refresh now**, so only set it for KBs you trust. A **Refresh now** on a KB built by the skill writes inside that KB (its `kb/`, `registry.yaml`, `README.md` and `.cache/repos/`). See [Keeping it fresh](#9-keeping-it-fresh).
+
+A minimal KB can be one folder with a `README.md`, attached to `my-org/*`.
 
 This page covers:
 1. [How a PR finds its KB](#1-how-a-pr-finds-its-kb) (the matching rules)
@@ -11,7 +18,7 @@ This page covers:
 4. [What to put in each service folder](#4-what-to-put-in-a-service-folder)
 5. [System-level context files](#5-system-level-context-files)
 6. [Monorepos](#6-monorepos-deploy-repos-infra-repos)
-7. [Registering the KB in PRism](#7-register-the-kb-in-prism)
+7. [Registering the KB in PRism](#7-register-the-kb-in-prism), and the [KB fields](#kb-fields)
 8. [Checking that it's picked up](#8-check-that-its-picked-up)
 9. [Keeping it fresh](#9-keeping-it-fresh)
 10. [A checklist](#10-checklist)
@@ -30,7 +37,7 @@ For every PR, each KB is checked with three rules. **Any** hit attaches that KB 
 | --- | --- | --- | --- |
 | 1 | **Registry** | a registry file listing `service → owner/repo` | PRs in a listed repo get that **service's folder** plus the KB's context files. Automatic, with no per-repo setup. |
 | 2 | **Monorepo paths** | the repo in `monorepos` (e.g. `my-org/deploy`) | A PR there gets every registered service whose **repo name or service name appears in the changed paths or title**. |
-| 3 | **Explicit attachment** | `attach: [{"repo": "my-org/x", "service": "x"}]` (or the UI) | That repo (globs like `my-org/*` work) gets the KB. With `service`, it also gets that folder. |
+| 3 | **Explicit attachment** | `attach: [{"repo": "my-org/x", "service": "x"}]` (or the UI) | That repo (globs like `my-org/*` or `my-org/payments-*` work) gets the KB. With `service`, it also gets that folder. Without it, the reviewer gets the context files and greps the KB. |
 
 A registered service counts **only if its service folder exists**. That way a registry entry for a service you haven't documented yet doesn't attach an empty KB. (If you set no `service_dir` at all, every registry entry counts.)
 
@@ -163,6 +170,20 @@ A PR there picks up a registered service when its **repo name or service name ap
 ```
 
 You can have as many KBs as you like, and a PR can match several. For example, a shared service documented in two KBs gets both.
+
+### KB fields
+
+| Field | Example | Meaning |
+| --- | --- | --- |
+| `id`, `name` | `payments`, `Payments platform` | `id` is lowercase and used in URLs. |
+| `path` | `~/docs/payments-kb` | Absolute, `~/…`, or relative to the PRism folder. |
+| `service_dir` | `kb/{service}` | Optional per-service folder. Every file in it is read for that service. |
+| `context_files` | `["README.md", "kb/*.md", "docs/**/*.md"]` | Globs for system-level docs read for every attached PR (up to 40 files). |
+| `registry` | `{"file": "services.yaml", "name_field": "name", "repo_field": "repo"}` | Optional. JSON (a list, or `{"services": [...]}`), or a simple YAML list (`- name: x` then `repo: owner/x`). |
+| `attach` | `[{"repo": "my-org/api-*"}]` | Explicit attachments. |
+| `monorepos` | `["my-org/deploy"]` | Repos matched by changed paths. |
+| `refresh_command` | `["./bin/kb", "update", "{service}"]` | Optional. Runs in the KB folder before a review (at most every `refresh_max_age_hours`) and on **Refresh now**. `null` means the KB is read as-is. Only for KBs you trust. |
+| `refresh_max_age_hours` | `24` | How often, at most, `refresh_command` runs before reviews (per service). `0` turns the pre-review refresh off. |
 
 ---
 

@@ -239,19 +239,11 @@ def ensure_files() -> None:
 
 # ------------------------------------------------------------------ GitHub
 
-def github_token_page(owner: str, write: bool) -> str:
-    params = {
-        "name": "PRism" if write else "PRism (read-only)",
-        "description": ("PRism local PR review: reads PRs, diffs and linked issues, and posts the review "
-                        "comments you approve in its UI. Can't push code or merge." if write else
-                        "PRism local PR review: reads PRs, diffs, review threads and linked issues. Read-only."),
-        "expires_in": "90",
-        "contents": "read", "metadata": "read", "issues": "read",
-        "pull_requests": "write" if write else "read",
-    }
-    if owner:
-        params["target_name"] = owner
-    return "https://github.com/settings/personal-access-tokens/new?" + urllib.parse.urlencode(params)
+def github_token_page() -> str:
+    """GitHub's new classic token page, pre-filled. `repo` lets PRism read PRs and post the comments and
+    approvals you confirm in its UI; `read:org` lets it see your organizations."""
+    params = {"description": "PRism", "scopes": "repo,read:org"}
+    return "https://github.com/settings/tokens/new?" + urllib.parse.urlencode(params)
 
 
 def check_github(token: str, label: str = "GITHUB_TOKEN") -> bool:
@@ -261,9 +253,6 @@ def check_github(token: str, label: str = "GITHUB_TOKEN") -> bool:
         fail(f"{label} {tail(token)} was rejected by GitHub ({status}): {(me or {}).get('message', 'no response')}")
         return False
     ok(f"{label} {tail(token)} works: signed in as {me.get('login')}")
-    if not token.startswith("github_pat_"):
-        warn("This isn't a fine-grained token (github_pat_…). Classic and OAuth tokens can usually push "
-             "and merge too. A fine-grained one limits PRism to what it needs.")
     q = urllib.parse.quote("is:pr is:open review-requested:@me")
     status, found = http_json(f"{GITHUB_API}/search/issues?q={q}&per_page=1",
                               {"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"})
@@ -271,7 +260,7 @@ def check_github(token: str, label: str = "GITHUB_TOKEN") -> bool:
         n = found.get("total_count", 0)
         (ok if n else warn)(f"It can see {n} open PR(s) requesting your review"
                             + ("" if n else " (fine if none are waiting; otherwise check the token's "
-                                            "repository access)"))
+                                            "scopes (repo, read:org) and SSO authorization)"))
         if not n:
             explain_repo_access(token, me.get("login", ""))
     return True
@@ -286,13 +275,12 @@ def explain_repo_access(token: str, login: str) -> None:
     owners = sorted({r["full_name"].split("/")[0] for r in repos})
     say(f"    It can reach {len(repos)} repo(s), owned by: {', '.join(owners) or 'nobody'}.")
     if not owners or owners == [login]:
-        warn("This token only reaches your personal repos. Create it with Resource owner = your organization "
-             "(./setup.sh github, and pick your organization). If your org approves tokens, it stays pending until an "
-             "admin approves it.")
+        warn("This token only reaches your personal repos. If your org uses SAML SSO, authorize the token: "
+             "https://github.com/settings/tokens, click Configure SSO next to it, then Authorize your org.")
 
 
 def choose_owner(configured: list[str]) -> str:
-    """Pick the token's owner from your organizations (found through an existing gh login), or type one."""
+    """Pick the organization whose PRs you review (found through an existing gh login), or type one."""
     found = []
     if shutil.which("gh"):
         out = subprocess.run(["gh", "api", "user/orgs", "--paginate", "--jq", ".[].login"],
@@ -317,8 +305,8 @@ def setup_github() -> None:
     cfg = read_config()
     orgs = ((cfg.get("github") or {}).get("orgs") or [])
     if shutil.which("gh") and subprocess.run(["gh", "auth", "status"], capture_output=True).returncode == 0:
-        say("  1 = create a token for PRism in the browser (recommended: limited to what PRism needs)")
-        say("  2 = reuse your existing `gh` login token (quick, but it can usually do anything you can, e.g. push)")
+        say("  1 = create a token for PRism in the browser (recommended)")
+        say("  2 = reuse your existing `gh` login token (quick, but it usually has more scopes than PRism needs)")
         if ask("Choose", "1") == "2":
             token = subprocess.run(["gh", "auth", "token"], capture_output=True, text=True).stdout.strip()
             if token and check_github(token):
@@ -326,16 +314,12 @@ def setup_github() -> None:
                 ok("Saved your gh login token as GITHUB_TOKEN")
                 return
             warn("Couldn't read a token from `gh auth token`. Using the browser instead.")
-    write = yes("Will you post comments or approve PRs from PRism's UI? "
-                "(the token then also gets 'Pull requests: write')")
-    say(f"  {BOLD}A fine-grained token sees the repos of ONE owner{RESET}: pick the organization whose PRs you review.")
     owner = choose_owner(orgs)
-    say("\n  In the page that opens: name, owner, expiry and permissions are filled in"
-        + (" (read code, read + write pull requests; it can't push or merge)." if write else " (read-only)."))
-    say(f"  {BOLD}You choose Repository access{RESET} (All repositories, or the ones you review),")
-    say(f"  then click {BOLD}Generate token{RESET} and copy it.")
-    say(f"  {DIM}If your org requires approval for tokens, an admin approves it before it can read org repos.{RESET}")
-    open_url(github_token_page(owner, write=write))
+    say(f"\n  In the page that opens, the note and scopes ({BOLD}repo{RESET}, {BOLD}read:org{RESET}) are filled in.")
+    say(f"  Pick an expiry, click {BOLD}Generate token{RESET} and copy it.")
+    say(f"  {BOLD}If your org uses SAML SSO{RESET}: back on the tokens list, click {BOLD}Configure SSO{RESET}")
+    say(f"  next to the token and {BOLD}Authorize{RESET} your org. Without that, org PRs don't show up.")
+    open_url(github_token_page())
     while True:
         token = secret("GitHub token")
         if not token:

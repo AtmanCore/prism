@@ -65,19 +65,13 @@ class TestEnvFile:
 
 
 class TestGithubTokenPage:
-    """The pre-filled fine-grained token page."""
+    """The pre-filled classic token page."""
 
-    @pytest.mark.parametrize(
-        "owner, write, name, pulls",
-        [("acme", True, "PRism", "write"), ("", False, "PRism (read-only)", "read")],
-    )
-    def test_prefills_permissions(self, setup_mod, owner, write, name, pulls):
-        url = urlparse(setup_mod.github_token_page(owner, write))
+    def test_prefills_scopes(self, setup_mod):
+        url = urlparse(setup_mod.github_token_page())
         params = {k: v[0] for k, v in parse_qs(url.query).items()}
-        assert f"{url.scheme}://{url.netloc}{url.path}" == "https://github.com/settings/personal-access-tokens/new"
-        assert (params["name"], params["pull_requests"], params.get("target_name")) == (name, pulls, owner or None)
-        assert (params["contents"], params["metadata"], params["issues"], params["expires_in"]) == (
-            "read", "read", "read", "90")
+        assert f"{url.scheme}://{url.netloc}{url.path}" == "https://github.com/settings/tokens/new"
+        assert params == {"description": "PRism", "scopes": "repo,read:org"}
 
 
 class TestYamlStr:
